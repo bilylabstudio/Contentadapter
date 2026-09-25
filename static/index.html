@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>IMSED · Adaptador de presentaciones</title>
+<style>
+  :root{
+    --navy:#1c2f57; --navy2:#16274a; --teal:#3fd6c0; --green:#a8e6c1;
+    --bg:#f4f5f7; --card:#ffffff; --text:#1c2f57; --muted:#6b7280;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  header{background:linear-gradient(135deg,var(--navy),var(--navy2));color:#fff;padding:28px 20px;}
+  header h1{margin:0;font-size:20px;letter-spacing:.02em}
+  header p{margin:6px 0 0;color:#c9d3e8;font-size:14px}
+  main{max-width:720px;margin:0 auto;padding:24px 16px 60px}
+  .card{background:var(--card);border-radius:14px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px}
+  label{display:block;font-size:13px;font-weight:600;color:var(--navy);margin-bottom:6px}
+  input[type=password], input[type=file]{width:100%;padding:10px 12px;border:1px solid #d8dce5;border-radius:8px;font-size:14px;background:#fff}
+  .drop{border:2px dashed #c7cede;border-radius:12px;padding:28px 16px;text-align:center;color:var(--muted);cursor:pointer;transition:.15s}
+  .drop.drag{border-color:var(--teal);background:#f0fdfa}
+  .drop small{display:block;margin-top:6px}
+  .filelist{margin-top:12px;font-size:13px;color:var(--text)}
+  .filelist div{padding:4px 0;border-bottom:1px solid #eee}
+  button{background:var(--navy);color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:600;cursor:pointer;width:100%;margin-top:16px}
+  button:disabled{opacity:.5;cursor:default}
+  button:hover:not(:disabled){background:var(--navy2)}
+  .status{margin-top:14px;font-size:14px;padding:12px;border-radius:8px;display:none}
+  .status.show{display:block}
+  .status.info{background:#eef2ff;color:var(--navy)}
+  .status.error{background:#fef2f2;color:#991b1b}
+  .status.ok{background:#f0fdf4;color:#166534}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  .spinner{display:inline-block;width:14px;height:14px;border:2px solid #ccc;border-top-color:var(--navy);border-radius:50%;animation:spin .7s linear infinite;margin-right:8px;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>/MSED · Adaptador de presentaciones</h1>
+  <p>Sube una o varias presentaciones antiguas (.pptx o .pdf) y descárgalas adaptadas al diseño de la plantilla madre.</p>
+</header>
+<main>
+  <div class="card">
+    <label for="apikey">API key de Gemini</label>
+    <input id="apikey" type="password" placeholder="Pégala aquí -- no se guarda en ningún sitio" autocomplete="off" />
+    <div class="hint">Se usa solo para esta transformación y no se almacena. Puedes guardarla en tu gestor de contraseñas para pegarla cada vez.</div>
+  </div>
+
+  <div class="card">
+    <label>Presentaciones a adaptar</label>
+    <div class="drop" id="drop">
+      Arrastra aquí tus archivos .pptx / .pdf, o haz clic para elegirlos
+      <small>Puedes seleccionar varios a la vez (carpeta completa de un máster)</small>
+    </div>
+    <input id="fileInput" type="file" accept=".pptx,.pdf" multiple style="display:none" />
+    <div class="filelist" id="fileList"></div>
+  </div>
+
+  <button id="go" disabled>Adaptar presentaciones</button>
+  <div class="status" id="status"></div>
+</main>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const fileList = document.getElementById('fileList');
+const goBtn = document.getElementById('go');
+const statusEl = document.getElementById('status');
+const apiKeyEl = document.getElementById('apikey');
+let files = [];
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+drop.addEventListener('drop', e => {
+  e.preventDefault(); drop.classList.remove('drag');
+  addFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => addFiles(fileInput.files));
+
+function addFiles(list) {
+  for (const f of list) {
+    if (/\.(pptx|pdf)$/i.test(f.name)) files.push(f);
+  }
+  renderFiles();
+}
+
+function renderFiles() {
+  fileList.innerHTML = files.map((f,i) =>
+    `<div>${f.name} <span style="color:#999">(${(f.size/1024/1024).toFixed(1)} MB)</span></div>`
+  ).join('');
+  goBtn.disabled = files.length === 0;
+}
+
+function setStatus(kind, html) {
+  statusEl.className = 'status show ' + kind;
+  statusEl.innerHTML = html;
+}
+
+goBtn.addEventListener('click', async () => {
+  const key = apiKeyEl.value.trim();
+  if (!key) { setStatus('error', 'Falta la API key de Gemini.'); return; }
+  if (files.length === 0) return;
+
+  goBtn.disabled = true;
+  setStatus('info', '<span class="spinner"></span>Adaptando ' + files.length + ' presentación(es)... esto puede tardar uno o dos minutos.');
+
+  const fd = new FormData();
+  fd.append('gemini_api_key', key);
+  for (const f of files) fd.append('files', f);
+
+  try {
+    const resp = await fetch('/transform', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      let msg = 'Error ' + resp.status;
+      try { const j = await resp.json(); msg = j.detail || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    const blob = await resp.blob();
+    const cd = resp.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="([^"]+)"/);
+    const name = match ? match[1] : 'presentaciones_adaptadas.zip';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setStatus('ok', 'Listo. Descarga iniciada: ' + name);
+  } catch (e) {
+    setStatus('error', 'Ha fallado: ' + e.message);
+  } finally {
+    goBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
