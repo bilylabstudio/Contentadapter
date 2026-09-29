@@ -21,7 +21,7 @@ Dos modos de construcción de diapositiva, según el layout de destino:
 Para las diapositivas con imagen (TEXTO + IMAGEN, IMAGEN + TEXTO,
 IMAGEN COMPLETA) se borra el placeholder de imagen y se inserta la imagen
 real en su mismo bounding box (ajustada por 'cover': se recorta para llenar
-el hueco sin deformarla).
+el hueco sin deformar).
 """
 from __future__ import annotations
 
@@ -172,28 +172,55 @@ def remove_shape_at(slide, pos: int) -> None:
         shp._element.getparent().remove(shp._element)
 
 
-def insert_image_cover(slide, box, image_bytes: bytes) -> None:
-    """Inserta una imagen ocupando exactamente `box` (left, top, width, height
-    en EMU), recortándola (cover-fit) para llenar el hueco sin deformarla."""
+def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
+    """Prepara (recorta cover-fit) una imagen para llenar `box` (left, top,
+    width, height en EMU) sin deformarla, SIN tocar la diapositiva. Devuelve
+    None si la imagen no se puede decodificar (formato no soportado -- p.ej.
+    WMF/EMF heredado de un .pptx antiguo -- bytes corruptos, dimensiones
+    inválidas, etc.) en vez de propagar la excepción: así una única imagen
+    problemática del documento de origen no puede tirar abajo la adaptación
+    completa del archivo. El llamador debe comprobar el resultado antes de
+    borrar la forma/placeholder original, para poder dejarlo intacto si la
+    imagen no es utilizable (degradación grácil)."""
     left, top, width, height = box
-    im = Image.open(io.BytesIO(image_bytes))
-    im = im.convert("RGB")
-    src_w, src_h = im.size
-    target_ratio = width / height
-    src_ratio = src_w / src_h
-    if src_ratio > target_ratio:
-        # imagen más ancha de lo necesario -> recorta lados
-        new_w = int(src_h * target_ratio)
-        x0 = (src_w - new_w) // 2
-        im = im.crop((x0, 0, x0 + new_w, src_h))
-    else:
-        new_h = int(src_w / target_ratio)
-        y0 = (src_h - new_h) // 2
-        im = im.crop((0, y0, src_w, y0 + new_h))
-    buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=88)
+    if not width or not height:
+        return None
+    try:
+        im = Image.open(io.BytesIO(image_bytes))
+        im = im.convert("RGB")
+        src_w, src_h = im.size
+        if src_w <= 0 or src_h <= 0:
+            return None
+        target_ratio = width / height
+        src_ratio = src_w / src_h
+        if src_ratio > target_ratio:
+            # imagen más ancha de lo necesario -> recorta lados
+            new_w = max(1, int(src_h * target_ratio))
+            x0 = (src_w - new_w) // 2
+            im = im.crop((x0, 0, x0 + new_w, src_h))
+        else:
+            new_h = max(1, int(src_w / target_ratio))
+            y0 = (src_h - new_h) // 2
+            im = im.crop((0, y0, src_w, y0 + new_h))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=88)
+    except Exception:
+        return None
     buf.seek(0)
+    return buf
+
+
+def insert_image_cover(slide, box, image_bytes: bytes) -> bool:
+    """Inserta una imagen ocupando exactamente `box` (left, top, width, height
+    en EMU), recortándola (cover-fit) para llenar el hueco sin deformarla.
+    Devuelve True si se insertó, False si la imagen no se pudo decodificar
+    (en cuyo caso no se ha añadido nada a la diapositiva)."""
+    left, top, width, height = box
+    buf = _prepare_cover_image(box, image_bytes)
+    if buf is None:
+        return False
     slide.shapes.add_picture(buf, left, top, width, height)
+    return True
 
 
 def get_placeholder(slide, idx: int):
@@ -234,15 +261,137 @@ def render_placeholder_slide(prs: Presentation, spec: dict):
         box = get_placeholder_box(layout, idx)
         ph = get_placeholder(slide, idx)
         if box and ph is not None:
-            remove_shape_at(slide, list(slide.shapes).index(ph))
-            insert_image_cover(slide, box, image_bytes)
+            buf = _prepare_cover_image(box, image_bytes)
+            if buf is not None:
+                remove_shape_at(slide, list(slide.shapes).index(ph))
+                slide.shapes.add_picture(buf, *box)
+            # si la imagen no se pudo decodificar, se deja el placeholder de
+            # texto/vacío original tal cual en vez de perder toda la diapositiva
     return slide
 
 
-def _fill_table(shape, rows: list[list[str]]) -> None:
+def _clear_cell_text(tc_el) -> None:
+    """Vacía el texto de una celda de tabla clonada (de una fila/columna
+    duplicada como plantilla), dejando su formato intacto (fuente, tamaño,
+    alineación, bordes) pero sin repetir el texto de la fila/columna de
+    origen."""
+    txBody = tc_el.find(qn("a:txBody"))
+    if txBody is None:
+        return
+    for p in txBody.findall(qn("a:p")):
+        for r in p.findall(qn("a:r")):
+            t = r.find(qn("a:t"))
+            if t is not None:
+                t.text = ""
+
+
+def _max_safe_table_rows(shape, sibling_shapes: list) -> int:
+    """Calcula cuántas filas puede tener la tabla como máximo sin invadir la
+    forma más próxima por debajo de ella en la diapositiva (p.ej. el pie de
+    página con el número de diapositiva). Calcula el margen a partir de la
+    geometría real de la diapositiva en vez de asumir un número de filas fijo,
+    para que siga siendo correcto si la plantilla madre cambia."""
+    table = shape.table
+    current_rows = list(table.rows)
+    if not current_rows:
+        return 0
+    avg_row_h = sum(r.height for r in current_rows) / len(current_rows)
+    if not avg_row_h:
+        return len(current_rows)
+    table_bottom = shape.top + shape.height
+    nearest_below = None
+    for sib in sibling_shapes:
+        if sib is shape or sib.top is None:
+            continue
+        if sib.top >= table_bottom and (nearest_below is None or sib.top < nearest_below):
+            nearest_below = sib.top
+    if nearest_below is None:
+        # no hay ninguna forma debajo en esta diapositiva: usa el borde
+        # inferior del slide (16:9, 7.5in) como límite conservador
+        nearest_below = Emu(int(7.5 * 914400))
+    headroom = nearest_below - table_bottom
+    if headroom <= 0:
+        return len(current_rows)
+    extra_rows = int(headroom // avg_row_h)
+    return len(current_rows) + max(0, extra_rows)
+
+
+def _grow_table_rows(table, target_row_count: int) -> None:
+    """Clona la última fila de la tabla (formato, bordes, alturas) hasta
+    alcanzar target_row_count filas, vaciando el texto de las filas nuevas."""
+    tbl = table._tbl
+    trs = tbl.findall(qn("a:tr"))
+    if not trs:
+        return
+    last_tr = trs[-1]
+    while len(tbl.findall(qn("a:tr"))) < target_row_count:
+        new_tr = copy.deepcopy(last_tr)
+        for tc in new_tr.findall(qn("a:tc")):
+            _clear_cell_text(tc)
+        tbl.append(new_tr)
+    table.notify_height_changed()
+
+
+def _grow_table_cols(table, target_col_count: int) -> None:
+    """Añade columnas a la tabla clonando la última columna (ancho y, en cada
+    fila, formato de la última celda) y redistribuye el ancho total original
+    a partes iguales entre todas las columnas, para que la tabla conserve su
+    ancho total y no se salga de su hueco en la plantilla."""
+    tbl = table._tbl
+    tblGrid = tbl.find(qn("a:tblGrid"))
+    if tblGrid is None:
+        return
+    grid_cols = tblGrid.findall(qn("a:gridCol"))
+    n_cols = len(grid_cols)
+    if n_cols == 0 or target_col_count <= n_cols:
+        return
+    total_width = sum(int(gc.get("w")) for gc in grid_cols)
+    to_add = target_col_count - n_cols
+    for _ in range(to_add):
+        grid_cols = tblGrid.findall(qn("a:gridCol"))
+        new_gc = copy.deepcopy(grid_cols[-1])
+        tblGrid.append(new_gc)
+        for tr in tbl.findall(qn("a:tr")):
+            tcs = tr.findall(qn("a:tc"))
+            if not tcs:
+                continue
+            new_tc = copy.deepcopy(tcs[-1])
+            _clear_cell_text(new_tc)
+            tr.append(new_tc)
+    grid_cols = tblGrid.findall(qn("a:gridCol"))
+    new_col_w = max(1, total_width // len(grid_cols))
+    for gc in grid_cols:
+        gc.set("w", str(new_col_w))
+    table.notify_width_changed()
+
+
+def _fill_table(shape, rows: list[list[str]], sibling_shapes: Optional[list] = None) -> None:
+    """Rellena la tabla con `rows` (datos EXACTOS extraídos del documento de
+    origen). Si esos datos no caben en la rejilla fija de la diapositiva de
+    ejemplo (más filas y/o columnas de las que trae la plantilla), la hace
+    crecer dinámicamente en vez de truncar en silencio -- el crecimiento de
+    filas se limita al margen de seguridad real antes de la siguiente forma
+    de la diapositiva (p.ej. el pie de página), para no pisar ningún
+    elemento; si aun así hubiera más filas de las que caben con margen, se
+    usa ese máximo seguro como último recurso (en vez de solapar formas)."""
     table = shape.table
     n_rows = len(table.rows)
     n_cols = len(table.columns)
+
+    needed_rows = len(rows)
+    needed_cols = max((len(r) for r in rows), default=0)
+
+    if needed_rows > n_rows and sibling_shapes is not None:
+        safe_max_rows = _max_safe_table_rows(shape, sibling_shapes)
+        target_rows = min(needed_rows, safe_max_rows)
+        if target_rows > n_rows:
+            _grow_table_rows(table, target_rows)
+            n_rows = len(table.rows)
+
+    if needed_cols > n_cols:
+        _grow_table_cols(table, needed_cols)
+        n_cols = len(table.columns)
+
     for r in range(n_rows):
         for c in range(n_cols):
             cell = table.cell(r, c)
@@ -281,14 +430,19 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
         if 0 <= pos < len(shapes):
             shp = shapes[pos]
             box = (shp.left, shp.top, shp.width, shp.height)
-            remove_shape_at(slide, pos)
-            insert_image_cover(slide, box, image_bytes)
+            buf = _prepare_cover_image(box, image_bytes)
+            if buf is not None:
+                remove_shape_at(slide, pos)
+                slide.shapes.add_picture(buf, *box)
+            # si la imagen no se pudo decodificar, se deja la forma original
+            # (p.ej. el placeholder de imagen de ejemplo) tal cual, en vez de
+            # perder toda la diapositiva
     table_spec = spec.get("table")
     if table_spec:
         pos = int(table_spec["pos"])
         shapes = list(slide.shapes)
         if 0 <= pos < len(shapes) and shapes[pos].has_table:
-            _fill_table(shapes[pos], table_spec["rows"])
+            _fill_table(shapes[pos], table_spec["rows"], sibling_shapes=shapes)
     return slide
 
 
