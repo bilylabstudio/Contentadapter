@@ -18,7 +18,13 @@ import httpx
 
 from .catalog import BY_ID, catalog_prompt_text
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+# "gemini-2.0-flash" fue retirado por Google (devolvía 404 Not Found en
+# generateContent). Usamos el alias "gemini-flash-latest", que Google
+# redirige automáticamente al último modelo Flash estable -- así no
+# volvemos a romper la app cada vez que retiren una versión concreta.
+# Se puede fijar una versión exacta vía la variable de entorno GEMINI_MODEL
+# si en el futuro hiciera falta.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
