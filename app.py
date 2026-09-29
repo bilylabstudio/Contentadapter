@@ -51,7 +51,13 @@ GEMINI_API_KEY_ENV = os.environ.get("GEMINI_API_KEY", "").strip()
 
 MAX_FILES = 25
 MAX_FILE_MB = 60
-MAX_CONTENT_LENGTH = MAX_FILES * MAX_FILE_MB * 1024 * 1024
+# Límite total por subida (todos los archivos del lote juntos). En Vercel
+# esto es irrelevante -- la plataforma corta en 4.5MB antes de llegar aquí,
+# por eso ese despliegue solo sirve para lotes pequeños -- pero en
+# EasyPanel/Docker (sin ese límite de plataforma) esto es lo único que
+# protege al servidor de una subida descontrolada.
+MAX_TOTAL_MB = 500
+MAX_CONTENT_LENGTH = MAX_TOTAL_MB * 1024 * 1024
 
 app = Flask(__name__, static_folder=str(BASE_DIR / "static"), static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -90,6 +96,14 @@ class AppError(Exception):
 @app.errorhandler(AppError)
 def handle_app_error(e: AppError):
     return jsonify({"detail": e.message}), e.status
+
+
+@app.errorhandler(413)
+def handle_too_large(e):
+    return jsonify({
+        "detail": f"El lote supera el límite de {MAX_TOTAL_MB}MB por subida. "
+                   "Divide los archivos en varias subidas más pequeñas."
+    }), 413
 
 
 def _ensure_master_template() -> Path:
