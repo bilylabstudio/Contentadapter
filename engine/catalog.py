@@ -41,7 +41,7 @@ TEMPLATES = [
         "id": "contenido_bullets",
         "example_index": 4,
         "layout": "CONTENIDO",
-        "when": "Diapositiva de texto con título + subtítulo + lista de puntos (agenda, objetivos, bibliografía, cualquier lista con viñetas). Usa \\n para separar cada punto en el campo 3.",
+        "when": "Diapositiva de texto con título + subtítulo + lista de puntos (agenda, objetivos, bibliografía, cualquier lista con viñetas). Usa \\n para separar cada punto en el campo 3. IMPORTANTE: úsala solo si la diapositiva de origen NO tiene ninguna imagen real extraída -- si SÍ hay imagen disponible, usa 'texto_imagen' o 'imagen_texto' en su lugar (mismo tipo de contenido, pero con la foto del original en vez de dejar la diapositiva plana).",
         "editable": {
             "0": "kicker corto (contexto: módulo/sesión o similar)",
             "1": "título de la diapositiva",
@@ -53,7 +53,7 @@ TEMPLATES = [
         "id": "contenido_simple",
         "example_index": 6,
         "layout": "CONTENIDO",
-        "when": "Diapositiva de texto con título + subtítulo + UN solo bloque de desarrollo (no es una lista, es una idea desarrollada en un párrafo corto o 2-3 frases).",
+        "when": "Diapositiva de texto con título + subtítulo + UN solo bloque de desarrollo (no es una lista, es una idea desarrollada en un párrafo corto o 2-3 frases). IMPORTANTE: úsala solo si la diapositiva de origen NO tiene ninguna imagen real extraída -- si SÍ hay imagen disponible, usa 'texto_imagen' o 'imagen_texto' en su lugar.",
         "editable": {
             "0": "kicker corto",
             "1": "título de la diapositiva",
@@ -76,7 +76,7 @@ TEMPLATES = [
         "id": "texto_imagen",
         "example_index": 7,
         "layout": "TEXTO + IMAGEN",
-        "when": "Texto a la izquierda + una imagen real a la derecha que aporta información (foto, captura, gráfico).",
+        "when": "Texto a la izquierda + una imagen real a la derecha. PRIORIZA esta plantilla (sobre 'contenido_bullets'/'contenido_simple') siempre que la diapositiva de origen tenga una imagen real extraída y el contenido sea una sola idea o una lista de puntos -- NO hace falta que la imagen sea un dato/gráfico: una foto de recurso/decorativa del documento original también sirve y es preferible a dejar la diapositiva sin ninguna imagen. Reciclar las fotos del documento original es un objetivo explícito de esta herramienta.",
         "editable": {
             "0": "kicker corto",
             "1": "título",
@@ -247,7 +247,7 @@ TEMPLATES = [
         "id": "imagen_texto",
         "example_index": None,
         "layout": "IMAGEN + TEXTO",
-        "when": "Como texto_imagen pero con la imagen a la IZQUIERDA y el texto a la derecha.",
+        "when": "Igual que 'texto_imagen' (misma prioridad: úsala cuando haya imagen real disponible y el contenido sea una idea/lista de puntos) pero con la imagen a la IZQUIERDA y el texto a la derecha. Alterna 'texto_imagen' e 'imagen_texto' entre diapositivas consecutivas con imagen para que el documento no se vea repetitivo (no pongas la foto siempre al mismo lado).",
         "placeholder_layout": True,
         "editable": {
             "0": "kicker corto",
