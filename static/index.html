@@ -43,12 +43,6 @@
 </header>
 <main>
   <div class="card">
-    <label for="apikey">API key de Gemini</label>
-    <input id="apikey" type="password" placeholder="Pégala aquí -- no se guarda en ningún sitio" autocomplete="off" />
-    <div class="hint">Se usa solo para esta transformación y no se almacena. Puedes guardarla en tu gestor de contraseñas para pegarla cada vez.</div>
-  </div>
-
-  <div class="card">
     <label>Presentaciones a adaptar</label>
     <div class="drop" id="drop">
       Arrastra aquí tus archivos .pptx / .pdf, o haz clic para elegirlos
@@ -68,7 +62,6 @@ const fileInput = document.getElementById('fileInput');
 const fileList = document.getElementById('fileList');
 const goBtn = document.getElementById('go');
 const statusEl = document.getElementById('status');
-const apiKeyEl = document.getElementById('apikey');
 let files = [];
 
 drop.addEventListener('click', () => fileInput.click());
@@ -100,15 +93,12 @@ function setStatus(kind, html) {
 }
 
 goBtn.addEventListener('click', async () => {
-  const key = apiKeyEl.value.trim();
-  if (!key) { setStatus('error', 'Falta la API key de Gemini.'); return; }
   if (files.length === 0) return;
 
   goBtn.disabled = true;
   setStatus('info', '<span class="spinner"></span>Adaptando ' + files.length + ' presentación(es)... esto puede tardar uno o dos minutos.');
 
   const fd = new FormData();
-  fd.append('gemini_api_key', key);
   for (const f of files) fd.append('files', f);
 
   try {
