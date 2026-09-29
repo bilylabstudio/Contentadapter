@@ -213,7 +213,7 @@ TEMPLATES = [
         "id": "tabla",
         "example_index": 13,
         "layout": "TABLA",
-        "when": "Datos tabulares reales (filas x columnas) que aparecían como tabla en el original. Máximo 5 filas de datos (más una fila de cabecera).",
+        "when": "Datos tabulares reales (filas x columnas) que aparecían como tabla en el original. La plantilla parte de una tabla de 5 filas x 4 columnas, pero el motor de renderizado la amplía automáticamente (filas y/o columnas) si el original tiene más datos, así que incluye SIEMPRE todas las filas y columnas reales de la tabla de origen -- no recortes datos tú para que quepan. Evita solo tablas gigantescas (más de ~10 filas o ~6 columnas), que quedarían demasiado apretadas: en ese caso resume o parte la tabla en dos diapositivas.",
         "editable": {
             "0": "kicker corto",
             "1": "título",
@@ -273,7 +273,7 @@ def catalog_prompt_text() -> str:
         if t.get("image_slot") or t.get("image_field"):
             lines.append("Esta plantilla admite UNA imagen real (campo 'image').")
         if t.get("table_slot"):
-            lines.append("Esta plantilla tiene una TABLA real: rellena 'table_rows' (lista de filas, cada fila lista de celdas de texto; primera fila = cabecera; máx. 6 filas incl. cabecera).")
+            lines.append("Esta plantilla tiene una TABLA real: rellena 'table_rows' (lista de filas, cada fila lista de celdas de texto; primera fila = cabecera). La tabla crece automáticamente si el original tiene más filas/columnas que la rejilla de partida (5x4) -- incluye TODOS los datos reales de la tabla de origen, sin recortar (evita solo tablas de más de ~10 filas o ~6 columnas, que quedarían demasiado apretadas).")
         lines.append("Campos editables (posición -> qué va ahí):")
         for pos, desc in t["editable"].items():
             lines.append(f"  {pos}: {desc}")
