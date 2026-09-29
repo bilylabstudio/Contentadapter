@@ -129,6 +129,26 @@ def _guess_deck_context(slides: list[dict], filename: str) -> str:
 # imagen en la plantilla madre. Mapea cada una a su gemela con foto.
 _IMAGE_UPGRADE = {"contenido_bullets", "contenido_simple"}
 
+# Umbral de longitud (caracteres) del cuerpo de texto por debajo del cual es
+# seguro forzar el cambio a una plantilla con imagen: esas plantillas usan
+# una caja de texto a MEDIA anchura (el resto lo ocupa la foto), en vez de
+# la anchura completa de 'contenido_bullets'/'contenido_simple'. El
+# autofit de PowerPoint (MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE, ver
+# build.set_shape_text) encoge la fuente si hace falta, pero no es
+# instantáneo en todos los visores y tiene un límite razonable de encogido
+# antes de volverse ilegible. Si el texto es más largo que este umbral, NO
+# forzamos el cambio de plantilla y dejamos el original a anchura completa
+# -- evitar que el texto se salga de su caja o pise la imagen tiene
+# prioridad sobre el reciclaje de fotos cuando ambos objetivos chocan.
+_MAX_SAFE_BODY_CHARS_FOR_IMAGE_UPGRADE = 420
+
+
+def _body_text_length(fields: list[dict]) -> int:
+    """Suma la longitud del/de los campo(s) de cuerpo (pos '3', el mismo en
+    contenido_bullets/contenido_simple/texto_imagen) de una lista de fields
+    del LLM."""
+    return sum(len(f.get("text") or "") for f in fields if f.get("pos") == "3")
+
 
 def _enforce_image_reuse(raw: dict, slide: dict, use_left_side: bool) -> dict:
     """Refuerzo determinista de la regla "usa la foto del original" del
@@ -153,6 +173,13 @@ def _enforce_image_reuse(raw: dict, slide: dict, use_left_side: bool) -> dict:
         return raw  # el LLM ya usó una imagen, no hay nada que forzar
 
     fields = raw.get("fields", []) or []
+    if _body_text_length(fields) > _MAX_SAFE_BODY_CHARS_FOR_IMAGE_UPGRADE:
+        # el cuerpo es demasiado largo para la caja a media anchura de las
+        # plantillas con imagen: mejor dejarlo en su plantilla original a
+        # anchura completa que arriesgarse a que se salga de su caja o pise
+        # la imagen
+        return raw
+
     new_template_id = "imagen_texto" if use_left_side else "texto_imagen"
     if new_template_id == "imagen_texto":
         # imagen_texto usa la posición "4" para el cuerpo en vez de "3"
