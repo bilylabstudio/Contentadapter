@@ -7,8 +7,11 @@ nada en base de datos ni en disco de forma persistente: cada request
 procesa sus archivos en memoria / un directorio temporal que se borra al
 terminar la respuesta.
 
-La API key de Gemini la manda el navegador en cada llamada (campo del
-formulario) -- no se guarda en el servidor ni en ningún sitio.
+La API key de Gemini se configura UNA VEZ como variable de entorno
+(GEMINI_API_KEY) en el propio despliegue (Vercel / EasyPanel) -- el
+formulario ya no la pide en cada uso. Sigue sin persistirse en ningún
+sitio: solo vive en la config del entorno del servidor, nunca en disco
+ni en base de datos.
 """
 from __future__ import annotations
 
@@ -39,6 +42,13 @@ MASTER_TEMPLATE_URL = (
 )
 MASTER_TEMPLATE_CACHE = Path(tempfile.gettempdir()) / "imsed_master_template.pptx"
 
+# Se configura una sola vez como variable de entorno del despliegue
+# (Settings -> Environment Variables en Vercel, o env del contenedor en
+# EasyPanel). El formulario ya no pide la key en cada transformación;
+# si por lo que sea se manda igualmente en el form (compatibilidad hacia
+# atrás), esa tiene prioridad sobre la de entorno.
+GEMINI_API_KEY_ENV = os.environ.get("GEMINI_API_KEY", "").strip()
+
 MAX_FILES = 25
 MAX_FILE_MB = 60
 MAX_CONTENT_LENGTH = MAX_FILES * MAX_FILE_MB * 1024 * 1024
@@ -66,6 +76,7 @@ def health():
         "ok": True,
         "master_template_bundled": MASTER_TEMPLATE.exists(),
         "master_template_cached": MASTER_TEMPLATE_CACHE.exists(),
+        "gemini_api_key_configured": bool(GEMINI_API_KEY_ENV),
     })
 
 
@@ -146,9 +157,14 @@ async def _process_batch(files_data: list[tuple[str, bytes]], api_key: str, mast
 
 @app.post("/transform")
 def transform():
-    api_key = request.form.get("gemini_api_key", "").strip()
+    api_key = request.form.get("gemini_api_key", "").strip() or GEMINI_API_KEY_ENV
     if not api_key:
-        raise AppError(400, "Falta la API key de Gemini")
+        raise AppError(
+            400,
+            "Falta la API key de Gemini: configura la variable de entorno "
+            "GEMINI_API_KEY en el despliegue (Vercel: Settings > Environment "
+            "Variables) y vuelve a desplegar.",
+        )
 
     uploaded = request.files.getlist("files")
     if not uploaded:
