@@ -67,11 +67,26 @@ claro, generaliza en vez de inventar.
 multipliques por más de 1.5x).
 - Elige la plantilla (template_id) que estructuralmente mejor encaje con el contenido de origen, \
 no la que más se parezca visualmente al original: lo importante es el TIPO de contenido \
-(¿es una lista? ¿una comparación? ¿un proceso? ¿una cita/dato? ¿una imagen?).
+(¿es una lista? ¿una comparación? ¿un proceso? ¿una cita/dato? ¿una imagen?) -- EXCEPTO por la \
+regla de imágenes de abajo, que tiene prioridad sobre esto para contenido de "idea única/lista".
 - Si la diapositiva de origen es una portada/título general del documento, usa 'portada'. Si es \
-un separador de bloque/tema, usa 'seccion'. Si es el cierre/agradecimiento, usa 'cierre'.
-- Si hay una imagen de origen realmente informativa (una captura, foto, gráfico) y existe una \
-plantilla con hueco de imagen, considera usarla -- pero el texto sigue siendo lo prioritario.
+un separador de bloque/tema, usa 'seccion'. Si es el cierre/agradecimiento, usa 'cierre'. Estas \
+plantillas (junto con las de tarjetas, pasos, dos columnas, dato destacado, tabla y ejercicio) \
+son intencionadamente planas y SIN foto -- así está diseñada la marca IMSED para esos casos, no \
+es un fallo, así que no intentes forzar una imagen ahí.
+- REGLA DE IMÁGENES (importante, es una queja recurrente del cliente: la presentación adaptada \
+se queda "vacía y monótona" si no se reutilizan las fotos del documento original): si la \
+diapositiva de origen tiene al menos una imagen real extraída Y el contenido encaja como "idea \
+única" o "lista de puntos" (el tipo de contenido de 'contenido_bullets'/'contenido_simple'), \
+usa SIEMPRE 'texto_imagen' o 'imagen_texto' en su lugar, poniendo esa imagen en 'image_index'. \
+NO hace falta que la imagen sea un dato/gráfico "informativo" -- una foto de recurso o decorativa \
+del documento original también cuenta y es preferible a una diapositiva plana sin imagen. Alterna \
+'texto_imagen' (imagen a la derecha) e 'imagen_texto' (imagen a la izquierda) en diapositivas \
+consecutivas con imagen para variar la composición. Usa 'imagen_completa' si la diapositiva de \
+origen es casi solo una foto grande con poco texto. Esta regla NO aplica a las plantillas de \
+tarjetas/pasos/dato destacado/etc. (ver punto anterior): si el contenido encaja mejor como \
+tarjetas o pasos por su estructura, mantén esa plantilla aunque haya imagen disponible -- esas \
+plantillas no tienen hueco de imagen por diseño.
 - Devuelve SIEMPRE 'fields' como lista de {pos, text} usando EXACTAMENTE las posiciones (pos) \
 que se indican en el catálogo para la plantilla elegida. No inventes posiciones nuevas.
 - Si la plantilla es de tarjetas/pasos repetidos y tienes menos elementos de los que caben, \
@@ -108,6 +123,52 @@ def _guess_deck_context(slides: list[dict], filename: str) -> str:
             if 15 <= len(line) <= 90 and line.strip():
                 return line.strip()
     return filename.rsplit(".", 1)[0]
+
+
+# Plantillas de "idea única / lista de puntos" que SÍ tienen equivalente con
+# imagen en la plantilla madre. Mapea cada una a su gemela con foto.
+_IMAGE_UPGRADE = {"contenido_bullets", "contenido_simple"}
+
+
+def _enforce_image_reuse(raw: dict, slide: dict, use_left_side: bool) -> dict:
+    """Refuerzo determinista de la regla "usa la foto del original" del
+    prompt: el LLM no siempre la sigue de forma fiable (es una instrucción de
+    texto, no una garantía), y el cliente ha pedido explícitamente más
+    reciclaje de fotos porque el resultado se veía "vacío y monótono". Si
+    Gemini elige una plantilla de texto plano para una diapositiva que SÍ
+    tiene una imagen real extraída (y no marcó ya una imagen), la reescribimos
+    aquí a la plantilla gemela con foto -- mismo contenido de texto, solo
+    cambia el layout y se añade la imagen. No toca nada si el LLM ya siguió
+    la regla, ni afecta a plantillas de tarjetas/pasos/etc. (esas son planas
+    por diseño de marca, no se tocan)."""
+    if raw.get("skip"):
+        return raw
+    if raw.get("template_id") not in _IMAGE_UPGRADE:
+        return raw
+    images = slide.get("images", [])
+    if not images:
+        return raw
+    existing_idx = raw.get("image_index")
+    if isinstance(existing_idx, int) and existing_idx >= 0:
+        return raw  # el LLM ya usó una imagen, no hay nada que forzar
+
+    fields = raw.get("fields", []) or []
+    new_template_id = "imagen_texto" if use_left_side else "texto_imagen"
+    if new_template_id == "imagen_texto":
+        # imagen_texto usa la posición "4" para el cuerpo en vez de "3"
+        new_fields = [
+            {**f, "pos": "4"} if f.get("pos") == "3" else dict(f)
+            for f in fields
+        ]
+    else:
+        new_fields = [dict(f) for f in fields]
+
+    return {
+        **raw,
+        "template_id": new_template_id,
+        "fields": new_fields,
+        "image_index": 0,
+    }
 
 
 def _resolve_spec(raw: dict) -> Optional[dict]:
@@ -213,6 +274,7 @@ async def map_deck(slides: list[dict], filename: str, api_key: str) -> list[Opti
                 except Exception as e:
                     results[i] = {"_error": str(e), "_slide_index": slide["index"]}
                     return
+                raw = _enforce_image_reuse(raw, slide, use_left_side=(i % 2 == 1))
                 spec = _resolve_spec(raw)
                 if spec is not None:
                     img_idx = spec.pop("_image_index", None)
