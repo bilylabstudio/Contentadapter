@@ -1,0 +1,20 @@
+{
+  "default": "general",
+  "masters": [
+    {
+      "id": "general",
+      "name": "General (sin máster concreto)",
+      "forms_url": "https://imsed.com/valora"
+    },
+    {
+      "id": "martech",
+      "name": "Máster en Martech: Tecnología Aplicada al Marketing",
+      "forms_url": ""
+    },
+    {
+      "id": "comunicacion-postdigital",
+      "name": "Máster en Estrategias de Comunicación Postdigital",
+      "forms_url": ""
+    }
+  ]
+}
