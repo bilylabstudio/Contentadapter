@@ -446,13 +446,159 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
     return slide
 
 
-def build_deck(master_path: str, output_path: str, slide_specs: list[dict], example_master_path: Optional[str] = None):
+# ---------------------------------------------------------------------------
+# Diapositiva de cierre con QR de valoración por máster
+# ---------------------------------------------------------------------------
+
+CLOSING_EXAMPLE_INDEX = 21  # diapositiva "Muchas gracias" + tarjeta con hueco de QR
+CLOSING_LAYOUT = "CIERRE"
+
+
+def make_qr_png(url: str) -> Optional[bytes]:
+    """Genera un QR (PNG, fondo blanco, módulos oscuros) para `url`. Devuelve
+    None si no hay URL o si la librería `segno` no está disponible / falla:
+    el llamador degrada quitando el hueco de QR en vez de romper la
+    presentación."""
+    if not (url or "").strip():
+        return None
+    try:
+        import segno
+        qr = segno.make(url.strip(), error="m")
+        buf = io.BytesIO()
+        qr.save(buf, kind="png", scale=12, border=1, dark="#1c2f57", light="#ffffff")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _find_qr_shapes(slide):
+    """Devuelve (cuadrado_hueco, etiqueta_QR) de la diapositiva de cierre. Se
+    localizan por contenido/geometría (etiqueta con texto 'QR' y el cuadrado
+    que la contiene), con las posiciones conocidas de la plantilla como
+    respaldo."""
+    shapes = list(slide.shapes)
+    label = None
+    for shp in shapes:
+        if shp.has_text_frame and shp.text_frame.text.strip().upper() == "QR":
+            label = shp
+            break
+    square = None
+    if label is not None:
+        for shp in shapes:
+            if shp is label or not shp.width or not shp.height:
+                continue
+            near_square = abs(shp.width - shp.height) <= 0.08 * max(shp.width, shp.height)
+            contains = (shp.left <= label.left and shp.top <= label.top
+                        and shp.left + shp.width >= label.left + label.width
+                        and shp.top + shp.height >= label.top + label.height)
+            if near_square and contains:
+                square = shp
+                break
+    if square is None and len(shapes) > 4:
+        square = shapes[3]
+    if label is None and len(shapes) > 4 and shapes[4].has_text_frame:
+        label = shapes[4]
+    return square, label
+
+
+def _display_url(url: str) -> str:
+    u = (url or "").strip()
+    for prefix in ("https://", "http://"):
+        if u.lower().startswith(prefix):
+            u = u[len(prefix):]
+    if u.lower().startswith("www."):
+        u = u[4:]
+    return u.rstrip("/")
+
+
+def _sync_visible_link(slide, url: str) -> None:
+    """El texto visible 'imsed.com/valora' de la tarjeta debe coincidir con el
+    destino real del QR: si el máster tiene su propio formulario, se muestra
+    esa dirección (sin esquema)."""
+    shown = _display_url(url)
+    if not shown:
+        return
+    for shp in slide.shapes:
+        if shp.has_text_frame and shp.text_frame.text.strip().lower() == "imsed.com/valora":
+            if shown.lower() != "imsed.com/valora":
+                set_shape_text(shp, shown)
+            return
+
+
+def place_qr_on_closing(slide, qr_png: Optional[bytes], url: Optional[str] = None) -> bool:
+    """Sustituye el hueco 'QR' de la diapositiva de cierre por la imagen del
+    QR (mismo tamaño y posición). Si no hay QR utilizable, se QUITA el hueco
+    y su etiqueta para no dejar un cuadro vacío con la palabra 'QR'. Devuelve
+    True si se insertó un QR."""
+    if url and qr_png:
+        _sync_visible_link(slide, url)
+    square, label = _find_qr_shapes(slide)
+    if square is None:
+        return False
+    box = (square.left, square.top, square.width, square.height)
+    ok = False
+    if qr_png:
+        try:
+            Image.open(io.BytesIO(qr_png)).verify()
+            ok = True
+        except Exception:
+            ok = False
+    for shp in (square, label):
+        if shp is not None:
+            shp._element.getparent().remove(shp._element)
+    if ok:
+        slide.shapes.add_picture(io.BytesIO(qr_png), *box)
+    return ok
+
+
+def normalize_closing_spec(slide_specs: list[dict]) -> list[dict]:
+    """Garantiza que la presentación termina con UNA sola diapositiva de
+    cierre (con tarjeta de valoración + hueco de QR): quita cualquier cierre
+    que haya propuesto el mapeo (conservando su texto de título, si lo
+    había) y añade uno al final."""
+    title = None
+    kept = []
+    for spec in slide_specs:
+        is_closing = (
+            (spec.get("mode") == "duplicate" and spec.get("example_index") == CLOSING_EXAMPLE_INDEX)
+            or (spec.get("mode") == "placeholder" and spec.get("layout") == CLOSING_LAYOUT)
+        )
+        if is_closing:
+            if title is None:
+                if spec.get("mode") == "duplicate":
+                    title = (spec.get("shape_text") or {}).get("0")
+                else:
+                    title = (spec.get("fields") or {}).get("0")
+            continue
+        kept.append(spec)
+    closing = {
+        "mode": "duplicate",
+        "example_index": CLOSING_EXAMPLE_INDEX,
+        "shape_text": {"0": title} if title else {},
+        "images": {},
+        "delete_positions": [],
+        "_closing": True,
+    }
+    kept.append(closing)
+    return kept
+
+
+def build_deck(master_path: str, output_path: str, slide_specs: list[dict], example_master_path: Optional[str] = None,
+               qr_url: Optional[str] = None):
     """example_master_path: si se pasa, se usa una copia SIN TOCAR de la plantilla
     (con sus 22 diapositivas de ejemplo intactas) como fuente para duplicar
     diapositivas de ejemplo, mientras que master_path es donde se construye el
     resultado final (que empieza vacío). Si no se pasa, se usa master_path para
-    ambas cosas (duplicando antes de vaciar)."""
+    ambas cosas (duplicando antes de vaciar).
+
+    qr_url: si se pasa, la presentación termina SIEMPRE con una única
+    diapositiva de cierre cuyo hueco de QR contiene el QR de esa URL
+    (formulario de valoración del máster). Si no se pasa, no se toca el
+    cierre."""
     prs = Presentation(master_path)
+    if qr_url is not None:
+        slide_specs = normalize_closing_spec(slide_specs)
+        qr_png = make_qr_png(qr_url)
 
     if example_master_path:
         example_prs = Presentation(example_master_path)
@@ -497,7 +643,9 @@ def build_deck(master_path: str, output_path: str, slide_specs: list[dict], exam
             if mode == "placeholder":
                 render_placeholder_slide(prs, spec)
             else:
-                render_duplicate_slide(prs, spec)
+                new_slide = render_duplicate_slide(prs, spec)
+                if spec.get("_closing"):
+                    place_qr_on_closing(new_slide, qr_png, qr_url)
         # borra las N diapositivas originales (las primeras n_originals)
         xml_slides = prs.slides._sldIdLst
         slide_ids = list(xml_slides)
