@@ -17,7 +17,7 @@
   main{max-width:720px;margin:0 auto;padding:24px 16px 60px}
   .card{background:var(--card);border-radius:14px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px}
   label{display:block;font-size:13px;font-weight:600;color:var(--navy);margin-bottom:6px}
-  input[type=password], input[type=file]{width:100%;padding:10px 12px;border:1px solid #d8dce5;border-radius:8px;font-size:14px;background:#fff}
+  select, input[type=password], input[type=file]{width:100%;padding:10px 12px;border:1px solid #d8dce5;border-radius:8px;font-size:14px;background:#fff}
   .drop{border:2px dashed #c7cede;border-radius:12px;padding:28px 16px;text-align:center;color:var(--muted);cursor:pointer;transition:.15s}
   .drop.drag{border-color:var(--teal);background:#f0fdfa}
   .drop small{display:block;margin-top:6px}
@@ -43,6 +43,12 @@
 </header>
 <main>
   <div class="card">
+    <label for="master">Máster</label>
+    <select id="master" style="width:100%;padding:10px 12px;border:1px solid #d8dce5;border-radius:8px;font-size:14px;background:#fff"></select>
+    <div class="hint">Determina el QR de valoración (formulario de la clase) de la última diapositiva.</div>
+  </div>
+
+  <div class="card">
     <label>Presentaciones a adaptar</label>
     <div class="drop" id="drop">
       Arrastra aquí tus archivos .pptx / .pdf, o haz clic para elegirlos
@@ -63,6 +69,15 @@ const fileList = document.getElementById('fileList');
 const goBtn = document.getElementById('go');
 const statusEl = document.getElementById('status');
 let files = [];
+const masterSel = document.getElementById('master');
+
+fetch('/masters').then(r => r.json()).then(list => {
+  masterSel.innerHTML = list.map(m =>
+    `<option value="${m.id}">${m.name}${m.has_forms_url ? '' : ' (sin formulario propio)'}</option>`
+  ).join('');
+}).catch(() => {
+  masterSel.innerHTML = '<option value="">General</option>';
+});
 
 drop.addEventListener('click', () => fileInput.click());
 drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
@@ -100,6 +115,7 @@ goBtn.addEventListener('click', async () => {
 
   const fd = new FormData();
   for (const f of files) fd.append('files', f);
+  fd.append('master', masterSel.value);
 
   try {
     const resp = await fetch('/transform', { method: 'POST', body: fd });
