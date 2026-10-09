@@ -28,6 +28,7 @@ from flask import Flask, request, send_file, jsonify, Response
 from engine.build import build_deck
 from engine.extract import extract
 from engine.mapper import map_deck
+from engine.masters import forms_url_for, list_masters, masters_without_url, resolve_master
 
 BASE_DIR = Path(__file__).parent
 MASTER_TEMPLATE = BASE_DIR / "assets" / "master_template.pptx"
@@ -83,7 +84,15 @@ def health():
         "master_template_bundled": MASTER_TEMPLATE.exists(),
         "master_template_cached": MASTER_TEMPLATE_CACHE.exists(),
         "gemini_api_key_configured": bool(GEMINI_API_KEY_ENV),
+        "masters": len(list_masters()),
+        "masters_without_forms_url": masters_without_url(),
     })
+
+
+@app.get("/masters")
+def masters():
+    """Másters disponibles (para el desplegable de la web y para n8n)."""
+    return jsonify(list_masters())
 
 
 class AppError(Exception):
@@ -133,7 +142,7 @@ def _ensure_master_template() -> Path:
     return MASTER_TEMPLATE_CACHE
 
 
-async def _process_one(filename: str, raw_bytes: bytes, api_key: str, master_path: Path) -> bytes:
+async def _process_one(filename: str, raw_bytes: bytes, api_key: str, master_path: Path, qr_url: str) -> bytes:
     slides = extract(filename, io.BytesIO(raw_bytes))
     if not slides:
         raise AppError(400, f"No se pudo extraer contenido de {filename}")
@@ -150,16 +159,16 @@ async def _process_one(filename: str, raw_bytes: bytes, api_key: str, master_pat
 
     with tempfile.TemporaryDirectory() as tmp:
         out_path = Path(tmp) / "output.pptx"
-        build_deck(str(master_path), str(out_path), specs)
+        build_deck(str(master_path), str(out_path), specs, qr_url=qr_url)
         return out_path.read_bytes()
 
 
-async def _process_batch(files_data: list[tuple[str, bytes]], api_key: str, master_path: Path):
+async def _process_batch(files_data: list[tuple[str, bytes]], api_key: str, master_path: Path, qr_url: str):
     results: list[tuple[str, bytes]] = []
     errors: list[str] = []
     for filename, raw in files_data:
         try:
-            out_bytes = await _process_one(filename, raw, api_key, master_path)
+            out_bytes = await _process_one(filename, raw, api_key, master_path, qr_url)
             out_name = Path(filename).stem + "_IMSED.pptx"
             results.append((out_name, out_bytes))
         except AppError as e:
@@ -186,6 +195,15 @@ def transform():
     if len(uploaded) > MAX_FILES:
         raise AppError(400, f"Máximo {MAX_FILES} archivos por lote")
 
+    # Máster seleccionado (id o nombre; vacío = máster por defecto): decide a
+    # qué formulario de valoración apunta el QR de la diapositiva de cierre.
+    master_value = request.form.get("master", "").strip()
+    master = resolve_master(master_value)
+    if master is None:
+        valid = ", ".join(m["name"] for m in list_masters())
+        raise AppError(400, f"Máster no reconocido: {master_value!r}. Opciones: {valid}")
+    qr_url = forms_url_for(master)
+
     master_path = _ensure_master_template()
 
     files_data = []
@@ -197,7 +215,7 @@ def transform():
             continue
         files_data.append((f.filename, raw))
 
-    results, errors = asyncio.run(_process_batch(files_data, api_key, master_path))
+    results, errors = asyncio.run(_process_batch(files_data, api_key, master_path, qr_url))
     errors = skip_errors + errors
 
     if not results:
