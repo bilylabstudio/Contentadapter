@@ -7,13 +7,63 @@
       "forms_url": "https://imsed.com/valora"
     },
     {
+      "id": "postdigital",
+      "name": "Máster en Estrategias de Comunicación Postdigital",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSctxBjMhnij4nFliuQDhZ8UYRMEpmlrSHVMqrWDU9XwCkpwnQ/viewform?usp=dialog"
+    },
+    {
+      "id": "digital-media",
+      "name": "Máster en Digital Media y Tecnología",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSeOB_hkjSLrqsDKL_ctf8MPKcE9r5wut1EICZ9SMF_n2OY7ww/viewform?usp=dialog"
+    },
+    {
+      "id": "ciberseguridad",
+      "name": "Máster en Ciberseguridad",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSccwUSHDM9hBNyOgjAr-jvzM_A71zphQ3MZUZRuHUXqpqFVeQ/viewform?usp=dialog"
+    },
+    {
+      "id": "cloud-ia",
+      "name": "Máster en Cloud Computing e IA",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSei_fgkRg-0Oic08Nt0OI45ah9skTNJW1avV3IqX3lmFhIPtA/viewform?usp=dialog"
+    },
+    {
+      "id": "marketing-sostenible",
+      "name": "Máster en Marketing y Comunicación Corporativa Sostenible",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSfPP_gJ02o8jPHqqFBSA43ORvMP3PGEy59lg0N_XL6iETgClg/viewform?usp=dialog"
+    },
+    {
+      "id": "ia-comunicacion-medios",
+      "name": "Máster en Inteligencia Artificial en Comunicación y Medios",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSc51mH4Y1PhslW_1x5kFz8ZqzRVoZCIHC25Qog15xp6bsxkHA/viewform?usp=dialog"
+    },
+    {
+      "id": "transformacion-tecnologica",
+      "name": "Máster en Transformación Tecnológica Empresarial",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSexo6XaV_7JPxy19MjySzMTC_OH_TzeYRPbFvBAtnKoabdX4w/viewform?usp=dialog"
+    },
+    {
+      "id": "comunicacion-estrategica",
+      "name": "Máster en Comunicación Estratégica, Gestión Comercial y Ventas",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSfmIIHhCkMSkX_L0N5FYNn9MBCZ-hqdvJGAx6TfuAmYAycYKg/viewform?usp=dialog"
+    },
+    {
       "id": "martech",
-      "name": "Máster en Martech: Tecnología Aplicada al Marketing",
+      "name": "Máster en Martech: Tecnología e IA aplicada al Marketing",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSeBd1w2GfpCmJyjQ2lTm-1kO2srnqzKSnmNL5O3SQtJQJYRgQ/viewform?usp=dialog"
+    },
+    {
+      "id": "e-retail",
+      "name": "Máster en Marketing e-Retail",
+      "forms_url": "https://docs.google.com/forms/d/e/1FAIpQLSdY4EFu_7Lgnle7VZEctuOsBqtlYOjBwmlc1HdhimGvmxTzCw/viewform?usp=dialog"
+    },
+    {
+      "id": "creacion-contenido",
+      "name": "Máster en Creación de Contenido - del Reality al Factual",
       "forms_url": ""
     },
     {
-      "id": "comunicacion-postdigital",
-      "name": "Máster en Estrategias de Comunicación Postdigital",
+      "id": "rrhh-talento-tecnologico",
+      "name": "Máster en RRHH y Gestión del Talento Tecnológico",
       "forms_url": ""
     }
   ]
