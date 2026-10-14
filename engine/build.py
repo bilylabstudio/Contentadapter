@@ -452,6 +452,7 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
 
 CLOSING_EXAMPLE_INDEX = 21  # diapositiva "Muchas gracias" + tarjeta con hueco de QR
 CLOSING_LAYOUT = "CIERRE"
+MAX_VISIBLE_LINK_CHARS = 28  # ancho útil del texto del enlace en la tarjeta de valoración
 
 
 def make_qr_png(url: str) -> Optional[bytes]:
@@ -463,7 +464,10 @@ def make_qr_png(url: str) -> Optional[bytes]:
         return None
     try:
         import segno
-        qr = segno.make(url.strip(), error="m")
+        u = url.strip()
+        # URLs largas (Google Forms): corrección "L" -> menos módulos, más grandes
+        # y fáciles de escanear en el hueco de 1,45 in de la tarjeta
+        qr = segno.make(u, error="l" if len(u) > 60 else "m")
         buf = io.BytesIO()
         qr.save(buf, kind="png", scale=12, border=1, dark="#1c2f57", light="#ffffff")
         return buf.getvalue()
@@ -518,6 +522,10 @@ def _sync_visible_link(slide, url: str) -> None:
     shown = _display_url(url)
     if not shown:
         return
+    if len(shown) > MAX_VISIBLE_LINK_CHARS:
+        # enlaces largos (p.ej. Google Forms) no caben en la tarjeta: se
+        # sustituyen por un texto corto; el destino real va en el QR.
+        shown = "Escanea el código QR"
     for shp in slide.shapes:
         if shp.has_text_frame and shp.text_frame.text.strip().lower() == "imsed.com/valora":
             if shown.lower() != "imsed.com/valora":
