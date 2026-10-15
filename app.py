@@ -16,9 +16,12 @@ ni en base de datos.
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import os
+import shutil
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -29,6 +32,7 @@ from engine.build import build_deck
 from engine.extract import extract
 from engine.mapper import map_deck
 from engine.masters import forms_url_for, list_masters, masters_without_url, resolve_master
+from engine.slim import slim_pptx
 
 BASE_DIR = Path(__file__).parent
 MASTER_TEMPLATE = BASE_DIR / "assets" / "master_template.pptx"
@@ -51,7 +55,7 @@ MASTER_TEMPLATE_CACHE = Path(tempfile.gettempdir()) / "imsed_master_template.ppt
 GEMINI_API_KEY_ENV = os.environ.get("GEMINI_API_KEY", "").strip()
 
 MAX_FILES = 25
-MAX_FILE_MB = 60
+MAX_FILE_MB = 500
 # Límite total por subida (todos los archivos del lote juntos). En Vercel
 # esto es irrelevante -- la plataforma corta en 4.5MB antes de llegar aquí,
 # por eso ese despliegue solo sirve para lotes pequeños -- pero en
@@ -142,33 +146,77 @@ def _ensure_master_template() -> Path:
     return MASTER_TEMPLATE_CACHE
 
 
-async def _process_one(filename: str, raw_bytes: bytes, api_key: str, master_path: Path, qr_url: str) -> bytes:
-    slides = extract(filename, io.BytesIO(raw_bytes))
-    if not slides:
-        raise AppError(400, f"No se pudo extraer contenido de {filename}")
-
-    specs_raw = await map_deck(slides, filename, api_key)
-
-    errors = [s for s in specs_raw if s and "_error" in s]
-    if errors and len(errors) == len(specs_raw):
-        raise AppError(502, f"Gemini no respondió correctamente para {filename}: {errors[0]['_error']}")
-
-    specs = [s for s in specs_raw if s and "_error" not in s]
-    if not specs:
-        raise AppError(400, f"No se generó ninguna diapositiva adaptada para {filename}")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        out_path = Path(tmp) / "output.pptx"
-        build_deck(str(master_path), str(out_path), specs, qr_url=qr_url)
-        return out_path.read_bytes()
+def _rm(path) -> None:
+    """Borra un archivo temporal si existe (sin fallar)."""
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
-async def _process_batch(files_data: list[tuple[str, bytes]], api_key: str, master_path: Path, qr_url: str):
+def _free_memory() -> None:
+    """Devuelve al sistema la memoria que Python ya no usa (best effort)."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+# Solo se procesa UN archivo a la vez: el servidor es compartido con otros
+# servicios y varios archivos pesados en paralelo agotarían la RAM.
+_PROCESS_LOCK = threading.Lock()
+
+
+async def _process_one(filename: str, src_path: str, api_key: str, master_path: Path, qr_url: str) -> bytes:
+    """Adapta un archivo que ya está en disco (src_path). Borra el original y los
+    intermedios en cuanto dejan de hacer falta y libera memoria al terminar."""
+    work_path = None
+    try:
+        open_path = src_path
+        if filename.lower().endswith(".pptx"):
+            # Aligera el pptx pieza a pieza (sin cargarlo entero en RAM) antes de abrirlo.
+            work_path = src_path + ".slim.pptx"
+            slim_pptx(src_path, work_path)
+            _rm(src_path)  # el original pesado ya no hace falta: libera disco
+            open_path = work_path
+        with open(open_path, "rb") as fh:
+            slides = extract(filename, fh)
+        _rm(work_path)
+        work_path = None
+        if not slides:
+            raise AppError(400, f"No se pudo extraer contenido de {filename}")
+
+        specs_raw = await map_deck(slides, filename, api_key)
+
+        errors = [s for s in specs_raw if s and "_error" in s]
+        if errors and len(errors) == len(specs_raw):
+            raise AppError(502, f"Gemini no respondió correctamente para {filename}: {errors[0]['_error']}")
+
+        specs = [s for s in specs_raw if s and "_error" not in s]
+        if not specs:
+            raise AppError(400, f"No se generó ninguna diapositiva adaptada para {filename}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "output.pptx"
+            build_deck(str(master_path), str(out_path), specs, qr_url=qr_url)
+            return out_path.read_bytes()
+    except zipfile.BadZipFile:
+        raise AppError(400, "el archivo está dañado o no es un .pptx válido")
+    finally:
+        _rm(src_path)
+        _rm(work_path)
+        _free_memory()
+
+
+async def _process_batch(files_data: list[tuple[str, str]], api_key: str, master_path: Path, qr_url: str):
     results: list[tuple[str, bytes]] = []
     errors: list[str] = []
-    for filename, raw in files_data:
+    for filename, src_path in files_data:
         try:
-            out_bytes = await _process_one(filename, raw, api_key, master_path, qr_url)
+            out_bytes = await _process_one(filename, src_path, api_key, master_path, qr_url)
             out_name = Path(filename).stem + "_IMSED.pptx"
             results.append((out_name, out_bytes))
         except AppError as e:
@@ -206,17 +254,28 @@ def transform():
 
     master_path = _ensure_master_template()
 
-    files_data = []
-    skip_errors = []
-    for f in uploaded:
-        raw = f.read()
-        if len(raw) > MAX_FILE_MB * 1024 * 1024:
-            skip_errors.append(f"{f.filename}: supera los {MAX_FILE_MB}MB, se omite")
-            continue
-        files_data.append((f.filename, raw))
+    # Los archivos se guardan en un directorio temporal en disco (no en RAM) y
+    # se borran siempre al terminar, haya ido bien o mal.
+    upload_dir = tempfile.mkdtemp(prefix="imsed_up_")
+    try:
+        files_data = []
+        skip_errors = []
+        for i, f in enumerate(uploaded):
+            ext = Path(f.filename or "").suffix.lower()
+            path = os.path.join(upload_dir, f"{i}{ext}")
+            f.save(path)  # copia por bloques, sin cargar el archivo entero en memoria
+            if os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024:
+                _rm(path)
+                skip_errors.append(f"{f.filename}: supera los {MAX_FILE_MB}MB, se omite")
+                continue
+            files_data.append((f.filename, path))
 
-    results, errors = asyncio.run(_process_batch(files_data, api_key, master_path, qr_url))
-    errors = skip_errors + errors
+        with _PROCESS_LOCK:
+            results, errors = asyncio.run(_process_batch(files_data, api_key, master_path, qr_url))
+        errors = skip_errors + errors
+    finally:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        _free_memory()
 
     if not results:
         raise AppError(422, "No se pudo adaptar ningún archivo. " + " | ".join(errors))
