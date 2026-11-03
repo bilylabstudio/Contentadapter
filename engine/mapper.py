@@ -214,7 +214,8 @@ def _resolve_spec(raw: dict, keep_empty: bool = False, kicker_default: str = "")
     if keep_empty:
         # modo fiel: los huecos sin contenido se dejan EN BLANCO (si no, la
         # plantilla conservaría su texto de ejemplo)
-        fields = {f["pos"]: (f.get("text") or "") for f in raw.get("fields", [])}
+        fields = {str(f["pos"]): (f.get("text") or "") for f in raw.get("fields", [])
+                  if str(f.get("pos")) in tpl["editable"]}
     else:
         fields = {f["pos"]: f["text"] for f in raw.get("fields", []) if f.get("text")}
 
@@ -421,16 +422,21 @@ def _words(text: str) -> list[str]:
 
 def _raw_texts(raw: dict) -> tuple[str, str]:
     """(todo el texto del resultado, texto sin kicker) de un mapeo del LLM."""
+    tpl = BY_ID.get(raw.get("template_id")) or {}
+    editable = set((tpl.get("editable") or {}).keys())
     all_t, nok_t = [], []
     for f in raw.get("fields", []) or []:
+        if str(f.get("pos")) not in editable:
+            continue  # posición que el motor de render no usaría: ese texto se perdería
         t = f.get("text") or ""
         all_t.append(t)
         if str(f.get("pos")) != "0":
             nok_t.append(t)
-    for row in raw.get("table_rows", []) or []:
-        for cell in row:
-            all_t.append(str(cell))
-            nok_t.append(str(cell))
+    if tpl.get("table_slot"):
+        for row in raw.get("table_rows", []) or []:
+            for cell in row:
+                all_t.append(str(cell))
+                nok_t.append(str(cell))
     return " ".join(all_t), " ".join(nok_t)
 
 
@@ -462,6 +468,18 @@ def _literal_raw(slide: dict) -> Optional[dict]:
     images = slide.get("images", [])
     if not lines:
         return None
+    tables = slide.get("tables") or []
+    if len(tables) == 1:
+        table_lines = {_BULLET_RE.sub("", " | ".join(c for c in row if c)).strip() for row in tables[0]}
+        other = [l for l in lines if l not in table_lines]
+        if len(other) <= 2:
+            fields = []
+            if other:
+                fields.append({"pos": "1", "text": other[0]})
+            if len(other) == 2:
+                fields.append({"pos": "2", "text": other[1]})
+            return {"skip": False, "template_id": "tabla", "image_index": -1, "fields": fields,
+                    "table_rows": [[str(c) for c in row] for row in tables[0]]}
     title = ""
     body = lines
     if len(lines) >= 2 and len(lines[0]) <= 100:
@@ -556,10 +574,15 @@ def _build_fiel_prompt(slide: dict, deck_context: str) -> str:
                 if n_images else "No hay imágenes reales extraídas de esta diapositiva.")
     blocks = slide.get("text_blocks") or [slide.get("text", "")]
     numbered = "\n".join(f"[{i + 1}] {b}" for i, b in enumerate(blocks)) or "(sin texto)"
+    tables = slide.get("tables") or []
+    table_line = ""
+    if tables:
+        table_line = ("\nLa diapositiva contiene una TABLA real (usa la plantilla 'tabla' y copia todas las filas "
+                      "y columnas en 'table_rows', primera fila = cabecera): " + json.dumps(tables[0], ensure_ascii=False) + "\n")
     return (
         f"Documento: {deck_context}\n\n"
         f"Bloques de texto de ESTA diapositiva de origen, en orden de lectura (cópialos literalmente):\n"
-        f"---\n{numbered}\n---\n\n{img_line}\n\nDevuelve el JSON de mapeo para esta diapositiva."
+        f"---\n{numbered}\n---\n{table_line}\n{img_line}\n\nDevuelve el JSON de mapeo para esta diapositiva."
     )
 
 
