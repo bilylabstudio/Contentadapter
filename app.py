@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import gc
 import io
+import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -30,7 +32,7 @@ from flask import Flask, request, send_file, jsonify, Response
 
 from engine.build import build_deck
 from engine.extract import extract
-from engine.mapper import map_deck
+from engine.mapper import map_deck, map_deck_fiel
 from engine.masters import forms_url_for, list_masters, masters_without_url, resolve_master
 from engine.slim import slim_pptx
 
@@ -70,6 +72,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
 @app.after_request
 def add_cors(resp):
+    resp.headers["Access-Control-Expose-Headers"] = "X-Informe, Content-Disposition"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "*"
@@ -170,9 +173,27 @@ def _free_memory() -> None:
 _PROCESS_LOCK = threading.Lock()
 
 
-async def _process_one(filename: str, src_path: str, api_key: str, master_path: Path, qr_url: str) -> bytes:
+MODES = ("adaptado", "fiel", "ambos")
+
+
+def _scrub(e) -> str:
+    """Texto de un error sin posibles API keys en URLs (key=...)."""
+    return re.sub(r"key=[^&\s'\"]+", "key=***", str(e))[:300]
+
+
+def _suffix_for(mode_run: str, mode_req: str) -> str:
+    """Sufijo del nombre de salida. Con el modo 'adaptado' solo (el de siempre)
+    se mantiene '_IMSED' para no romper la automatización de Drive."""
+    if mode_run == "fiel":
+        return "_IMSED_fiel"
+    return "_IMSED" if mode_req == "adaptado" else "_IMSED_adaptada"
+
+
+async def _process_one(filename: str, src_path: str, api_key: str, master_path: Path, qr_url: str,
+                       mode: str = "adaptado", master_name: str = "") -> tuple[list[tuple[str, bytes]], list[str], dict]:
     """Adapta un archivo que ya está en disco (src_path). Borra el original y los
-    intermedios en cuanto dejan de hacer falta y libera memoria al terminar."""
+    intermedios en cuanto dejan de hacer falta y libera memoria al terminar.
+    Devuelve ([(sufijo, bytes)], avisos, informe). mode: adaptado | fiel | ambos."""
     work_path = None
     try:
         open_path = src_path
@@ -189,20 +210,40 @@ async def _process_one(filename: str, src_path: str, api_key: str, master_path: 
         if not slides:
             raise AppError(400, f"No se pudo extraer contenido de {filename}")
 
-        specs_raw = await map_deck(slides, filename, api_key)
+        outputs: list[tuple[str, bytes]] = []
+        notes: list[str] = []
+        report: dict = {}
+        runs = ["fiel", "adaptado"] if mode == "ambos" else [mode]
+        for run in runs:
+            try:
+                if run == "fiel":
+                    specs_raw, rep = await map_deck_fiel(slides, filename, api_key, master_name=master_name)
+                else:
+                    specs_raw = await map_deck(slides, filename, api_key)
+                    rep = {}
 
-        errors = [s for s in specs_raw if s and "_error" in s]
-        if errors and len(errors) == len(specs_raw):
-            raise AppError(502, f"Gemini no respondió correctamente para {filename}: {errors[0]['_error']}")
+                errors = [s for s in specs_raw if s and "_error" in s]
+                if errors and len(errors) == len(specs_raw):
+                    raise AppError(502, f"Gemini no respondió correctamente para {filename}: {errors[0]['_error']}")
 
-        specs = [s for s in specs_raw if s and "_error" not in s]
-        if not specs:
-            raise AppError(400, f"No se generó ninguna diapositiva adaptada para {filename}")
+                specs = [s for s in specs_raw if s and "_error" not in s]
+                if not specs:
+                    raise AppError(400, f"No se generó ninguna diapositiva adaptada para {filename}")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            out_path = Path(tmp) / "output.pptx"
-            build_deck(str(master_path), str(out_path), specs, qr_url=qr_url)
-            return out_path.read_bytes()
+                with tempfile.TemporaryDirectory() as tmp:
+                    out_path = Path(tmp) / "output.pptx"
+                    build_deck(str(master_path), str(out_path), specs, qr_url=qr_url)
+                    outputs.append((_suffix_for(run, mode), out_path.read_bytes()))
+                if run == "adaptado":
+                    rep = {"diapositivas_origen": len(slides), "diapositivas_resultado": len(specs)}
+                report[run] = rep
+            except AppError as e:
+                if mode != "ambos":
+                    raise
+                notes.append(f"{filename} ({run}): {e.message}")
+        if not outputs:
+            raise AppError(502, f"No se pudo generar ninguna versión de {filename}: " + " | ".join(notes))
+        return outputs, notes, report
     except zipfile.BadZipFile:
         raise AppError(400, "el archivo está dañado o no es un .pptx válido")
     finally:
@@ -211,19 +252,32 @@ async def _process_one(filename: str, src_path: str, api_key: str, master_path: 
         _free_memory()
 
 
-async def _process_batch(files_data: list[tuple[str, str]], api_key: str, master_path: Path, qr_url: str):
+async def _process_batch(files_data: list[tuple[str, str]], api_key: str, master_path: Path, qr_url: str,
+                         mode: str = "adaptado", master_name: str = ""):
     results: list[tuple[str, bytes]] = []
     errors: list[str] = []
+    reports: dict = {}
     for filename, src_path in files_data:
         try:
-            out_bytes = await _process_one(filename, src_path, api_key, master_path, qr_url)
-            out_name = Path(filename).stem + "_IMSED.pptx"
-            results.append((out_name, out_bytes))
+            outputs, notes, report = await _process_one(filename, src_path, api_key, master_path, qr_url, mode, master_name)
+            stem = Path(filename).stem
+            for suffix, out_bytes in outputs:
+                results.append((stem + suffix + ".pptx", out_bytes))
+            errors.extend(notes)
+            reports[filename[:60]] = report
         except AppError as e:
             errors.append(f"{filename}: {e.message}")
         except Exception as e:
-            errors.append(f"{filename}: error inesperado ({e})")
-    return results, errors
+            errors.append(f"{filename}: error inesperado ({_scrub(e)})")
+    return results, errors, reports
+
+
+def _report_header(reports: dict) -> str:
+    """Resumen del proceso (diapositivas, ajustes...) en una cabecera HTTP ASCII."""
+    try:
+        return json.dumps(reports, ensure_ascii=True, separators=(",", ":"))[:1500]
+    except Exception:
+        return "{}"
 
 
 @app.post("/transform")
@@ -252,6 +306,12 @@ def transform():
         raise AppError(400, f"Máster no reconocido: {master_value!r}. Opciones: {valid}")
     qr_url = forms_url_for(master)
 
+    # Modo: 'adaptado' (el de siempre: condensa y recoloca), 'fiel' (traspaso
+    # literal del contenido a la plantilla) o 'ambos' (genera las dos versiones).
+    mode = request.form.get("mode", "adaptado").strip().lower() or "adaptado"
+    if mode not in MODES:
+        raise AppError(400, f"Modo no reconocido: {mode!r}. Opciones: {', '.join(MODES)}")
+
     master_path = _ensure_master_template()
 
     # Los archivos se guardan en un directorio temporal en disco (no en RAM) y
@@ -271,7 +331,7 @@ def transform():
             files_data.append((f.filename, path))
 
         with _PROCESS_LOCK:
-            results, errors = asyncio.run(_process_batch(files_data, api_key, master_path, qr_url))
+            results, errors, reports = asyncio.run(_process_batch(files_data, api_key, master_path, qr_url, mode, master.get("name", "")))
         errors = skip_errors + errors
     finally:
         shutil.rmtree(upload_dir, ignore_errors=True)
@@ -282,12 +342,14 @@ def transform():
 
     if len(results) == 1 and not errors:
         name, data = results[0]
-        return send_file(
+        resp = send_file(
             io.BytesIO(data),
             mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             as_attachment=True,
             download_name=name,
         )
+        resp.headers["X-Informe"] = _report_header(reports)
+        return resp
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -296,12 +358,14 @@ def transform():
         if errors:
             zf.writestr("errores.txt", "\n".join(errors))
     buf.seek(0)
-    return send_file(
+    resp = send_file(
         buf,
         mimetype="application/zip",
         as_attachment=True,
         download_name="presentaciones_adaptadas.zip",
     )
+    resp.headers["X-Informe"] = _report_header(reports)
+    return resp
 
 
 if __name__ == "__main__":
