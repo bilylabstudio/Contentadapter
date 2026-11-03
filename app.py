@@ -203,8 +203,14 @@ async def _process_one(filename: str, src_path: str, api_key: str, master_path: 
             slim_pptx(src_path, work_path)
             _rm(src_path)  # el original pesado ya no hace falta: libera disco
             open_path = work_path
-        with open(open_path, "rb") as fh:
-            slides = extract(filename, fh)
+        try:
+            with open(open_path, "rb") as fh:
+                slides = extract(filename, fh)
+        except (AppError, zipfile.BadZipFile):
+            raise
+        except Exception as e:
+            # PDF/PPTX ilegible (dañado, protegido, formato raro): mensaje claro
+            raise AppError(400, f"el archivo está dañado, protegido o no se puede leer ({type(e).__name__})")
         _rm(work_path)
         work_path = None
         if not slides:
@@ -257,14 +263,26 @@ async def _process_batch(files_data: list[tuple[str, str]], api_key: str, master
     results: list[tuple[str, bytes]] = []
     errors: list[str] = []
     reports: dict = {}
+    used: set = set()
     for filename, src_path in files_data:
         try:
             outputs, notes, report = await _process_one(filename, src_path, api_key, master_path, qr_url, mode, master_name)
             stem = Path(filename).stem
+            # dos archivos con el mismo nombre no deben pisarse dentro del zip
+            n = 1
+            base = stem
+            while any((base + sfx + ".pptx").lower() in used for sfx, _ in outputs):
+                n += 1
+                base = f"{stem} ({n})"
             for suffix, out_bytes in outputs:
-                results.append((stem + suffix + ".pptx", out_bytes))
+                out_name = base + suffix + ".pptx"
+                used.add(out_name.lower())
+                results.append((out_name, out_bytes))
             errors.extend(notes)
-            reports[filename[:60]] = report
+            key = filename[:60]
+            if key in reports:
+                key = f"{key} ({n if n > 1 else len(reports) + 1})"
+            reports[key] = report
         except AppError as e:
             errors.append(f"{filename}: {e.message}")
         except Exception as e:
