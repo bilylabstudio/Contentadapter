@@ -262,10 +262,13 @@ TEMPLATES = [
 BY_ID = {t["id"]: t for t in TEMPLATES}
 
 
-def catalog_prompt_text() -> str:
-    """Serializa el catálogo a texto compacto para el prompt del LLM."""
+def catalog_prompt_text(only=None) -> str:
+    """Serializa el catálogo a texto compacto para el prompt del LLM.
+    `only`: conjunto de ids de plantilla a incluir (None = todas)."""
     lines = []
     for t in TEMPLATES:
+        if only is not None and t["id"] not in only:
+            continue
         lines.append(f"### {t['id']}  (layout: {t['layout']})")
         lines.append(f"Cuándo usarla: {t['when']}")
         if t.get("groups"):
