@@ -12,6 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import unicodedata
+from collections import Counter
 from typing import Optional
 
 import httpx
@@ -198,7 +201,7 @@ def _enforce_image_reuse(raw: dict, slide: dict, use_left_side: bool) -> dict:
     }
 
 
-def _resolve_spec(raw: dict) -> Optional[dict]:
+def _resolve_spec(raw: dict, keep_empty: bool = False, kicker_default: str = "") -> Optional[dict]:
     """Convierte la respuesta del LLM (con template_id del catálogo) en un
     'render spec' que engine.build.build_deck entiende (con example_index,
     modo, delete_positions resueltos a partir de omit_groups, etc.)."""
@@ -208,7 +211,12 @@ def _resolve_spec(raw: dict) -> Optional[dict]:
     if tpl is None:
         return None
 
-    fields = {f["pos"]: f["text"] for f in raw.get("fields", []) if f.get("text")}
+    if keep_empty:
+        # modo fiel: los huecos sin contenido se dejan EN BLANCO (si no, la
+        # plantilla conservaría su texto de ejemplo)
+        fields = {f["pos"]: (f.get("text") or "") for f in raw.get("fields", [])}
+    else:
+        fields = {f["pos"]: f["text"] for f in raw.get("fields", []) if f.get("text")}
 
     delete_positions = []
     groups = tpl.get("groups")
@@ -218,6 +226,18 @@ def _resolve_spec(raw: dict) -> Optional[dict]:
                 for pos in groups[gi]:
                     delete_positions.append(int(pos))
                     fields.pop(pos, None)
+
+    if keep_empty:
+        deleted = {str(p) for p in delete_positions}
+        for pos, desc in tpl["editable"].items():
+            if pos in fields and fields[pos]:
+                continue
+            if pos in deleted:
+                continue
+            if str(desc).lower().startswith("kicker") and kicker_default:
+                fields[pos] = kicker_default
+            else:
+                fields.setdefault(pos, "")
 
     if tpl.get("placeholder_layout"):
         spec = {
@@ -261,14 +281,14 @@ def _resolve_spec(raw: dict) -> Optional[dict]:
     return spec
 
 
-async def _call_gemini(client: httpx.AsyncClient, api_key: str, system_prompt: str, user_prompt: str) -> dict:
+async def _call_gemini(client: httpx.AsyncClient, api_key: str, system_prompt: str, user_prompt: str, temperature: float = 0.4) -> dict:
     payload = {
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "systemInstruction": {"role": "system", "parts": [{"text": system_prompt}]},
         "generationConfig": {
             "responseMimeType": "application/json",
             "responseSchema": RESPONSE_SCHEMA,
-            "temperature": 0.4,
+            "temperature": temperature,
         },
     }
     resp = await client.post(
@@ -299,21 +319,307 @@ async def map_deck(slides: list[dict], filename: str, api_key: str) -> list[Opti
                 try:
                     raw = await _call_gemini(client, api_key, system_prompt, user_prompt)
                 except Exception as e:
-                    results[i] = {"_error": str(e), "_slide_index": slide["index"]}
+                    results[i] = {"_error": _clean_err(e), "_slide_index": slide["index"]}
                     return
                 raw = _enforce_image_reuse(raw, slide, use_left_side=(i % 2 == 1))
                 spec = _resolve_spec(raw)
                 if spec is not None:
-                    img_idx = spec.pop("_image_index", None)
-                    if img_idx is not None:
-                        images = slide.get("images", [])
-                        if 0 <= img_idx < len(images):
-                            field = spec.pop("_image_field", None) or spec.pop("_image_slot", None)
-                            if field is not None:
-                                spec["images"][str(field)] = images[img_idx]
-                    spec.pop("_image_field", None)
-                    spec.pop("_image_slot", None)
+                    _attach_image(spec, slide)
                 results[i] = spec
 
         await asyncio.gather(*(worker(i, s) for i, s in enumerate(slides)))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Utilidades comunes
+# ---------------------------------------------------------------------------
+
+def _clean_err(e) -> str:
+    """Mensaje de error de Gemini SIN la API key (la URL de la petición la
+    lleva en el query string) y con un texto claro para el caso de falta de
+    saldo."""
+    msg = str(e)
+    msg = re.sub(r"key=[^&'\s\"]+", "key=***", msg)
+    if "402" in msg and "Payment Required" in msg:
+        return ("Gemini rechazó la petición por falta de saldo o facturación (402). "
+                "Avisa al administrador para recargar la cuenta de Gemini.")
+    if "429" in msg and "Too Many Requests" in msg:
+        return "Gemini ha alcanzado su límite de peticiones (429). Vuelve a intentarlo en unos minutos."
+    return msg[:300]
+
+
+def _attach_image(spec: dict, slide: dict) -> None:
+    """Resuelve la imagen elegida (índice) a bytes reales de la diapositiva de origen."""
+    img_idx = spec.pop("_image_index", None)
+    if img_idx is not None:
+        images = slide.get("images", [])
+        if 0 <= img_idx < len(images):
+            field = spec.pop("_image_field", None) or spec.pop("_image_slot", None)
+            if field is not None:
+                spec["images"][str(field)] = images[img_idx]
+    spec.pop("_image_field", None)
+    spec.pop("_image_slot", None)
+
+
+# ---------------------------------------------------------------------------
+# MODO FIEL: traspaso del contenido a la plantilla IMSED sin reescribirlo
+# ---------------------------------------------------------------------------
+
+# Plantillas permitidas en modo fiel: las que admiten texto libre o que
+# reproducen una estructura de origen sin tener que resumir. Se excluyen las
+# de tarjetas/pasos/dato destacado/ejercicio, que obligan a condensar.
+FIEL_TEMPLATES = {
+    "portada", "seccion", "contenido_bullets", "contenido_simple",
+    "texto_imagen", "imagen_texto", "imagen_completa", "tabla",
+    "dos_columnas", "cierre",
+}
+_BODY_POS = {"contenido_bullets": "3", "contenido_simple": "3", "texto_imagen": "3", "imagen_texto": "4"}
+_IMAGE_TEMPLATES = {"texto_imagen", "imagen_texto"}
+MAX_BODY_FULL = 650        # caracteres de cuerpo por diapositiva a anchura completa
+MAX_BODY_WITH_IMAGE = 420  # idem con imagen (caja a media anchura)
+COVERAGE_MIN = 0.98        # % mínimo de palabras de origen presentes en el resultado
+EXTRA_MAX = 0.08           # % máximo de palabras del resultado que no estaban en el origen
+
+FIEL_SYSTEM_PROMPT = """Eres el motor de una herramienta que TRASPASA presentaciones antiguas de IMSED \
+(másteres/formación) a una plantilla madre nueva SIN reescribir su contenido. El profesor quiere que \
+se respete SU contenido: solo cambia el diseño.
+
+Reglas (obligatorias):
+- COPIA el texto de origen LITERALMENTE: mismas palabras y mismo orden. No resumas, no reformules, no \
+acortes, no corrijas, no traduzcas, no añadas frases ni datos nuevos. No pierdas ninguna frase ni cifra.
+- Solo puedes: (a) repartir los bloques de texto de origen entre los huecos de la plantilla elegida \
+(título, subtítulo, cuerpo...), (b) separar con \\n las líneas o puntos que ya estaban separados en el \
+origen, (c) quitar el símbolo de viñeta (•, -, ·...) del inicio de una línea.
+- Una diapositiva de origen = UNA diapositiva de destino. No marques skip salvo que la diapositiva no \
+tenga NINGÚN texto ni imagen.
+- El título es el bloque corto del principio (si lo hay); el resto va en el cuerpo, en el orden original. \
+Deja en blanco ("") los huecos para los que el origen no tiene texto (subtítulo, etc.). No inventes \
+subtítulos ni kickers.
+- Elige la plantilla por la estructura del contenido: lista de puntos -> 'contenido_bullets'; párrafo o \
+texto corrido -> 'contenido_simple'; comparativa de dos columnas -> 'dos_columnas'; tabla real -> 'tabla' \
+(todas las filas y columnas, sin recortar); portada -> 'portada'; separador de tema -> 'seccion'; \
+despedida -> 'cierre'; foto grande casi sin texto -> 'imagen_completa'. Ante la duda usa \
+'contenido_bullets' o 'contenido_simple', que admiten cualquier texto.
+- Si la diapositiva de origen tiene una imagen real extraída y el contenido es una lista o párrafo, usa \
+'texto_imagen' o 'imagen_texto' con image_index 0 (alterna lados entre diapositivas consecutivas).
+- Devuelve SIEMPRE 'fields' como lista de {pos, text} usando EXACTAMENTE las posiciones del catálogo para \
+la plantilla elegida.
+
+CATÁLOGO DE PLANTILLAS DISPONIBLES:
+{catalog}
+"""
+
+_BULLET_RE = re.compile(r"^[\s•·▪●◦■□○\-–—*➢➤►✓✔]+")
+
+
+def _words(text: str) -> list[str]:
+    s = unicodedata.normalize("NFKD", (text or "").lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.findall(r"[a-z0-9]+", s)
+
+
+def _raw_texts(raw: dict) -> tuple[str, str]:
+    """(todo el texto del resultado, texto sin kicker) de un mapeo del LLM."""
+    all_t, nok_t = [], []
+    for f in raw.get("fields", []) or []:
+        t = f.get("text") or ""
+        all_t.append(t)
+        if str(f.get("pos")) != "0":
+            nok_t.append(t)
+    for row in raw.get("table_rows", []) or []:
+        for cell in row:
+            all_t.append(str(cell))
+            nok_t.append(str(cell))
+    return " ".join(all_t), " ".join(nok_t)
+
+
+def _fiel_check(raw: dict, slide: dict) -> tuple[bool, float]:
+    """¿Conserva el mapeo del LLM el contenido de origen? Devuelve (ok, cobertura)."""
+    src = Counter(_words(slide.get("text", "")))
+    n_src = sum(src.values())
+    if n_src == 0:
+        return True, 1.0
+    if raw.get("skip"):
+        return (n_src <= 2), 0.0
+    all_t, nok_t = _raw_texts(raw)
+    out_all = Counter(_words(all_t))
+    out_nok = Counter(_words(nok_t))
+    coverage = sum((src & out_all).values()) / n_src
+    n_out = sum(out_nok.values())
+    extra = (sum((out_nok - src).values()) / n_out) if n_out else 0.0
+    return (coverage >= COVERAGE_MIN and extra <= EXTRA_MAX), coverage
+
+
+def _literal_raw(slide: dict) -> Optional[dict]:
+    """Traspaso 100 % literal sin LLM: primera línea corta = título, el resto = cuerpo."""
+    lines = []
+    for b in slide.get("text_blocks") or slide.get("text", "").split("\n"):
+        for l in str(b).split("\n"):
+            l = _BULLET_RE.sub("", l).strip()
+            if l:
+                lines.append(l)
+    images = slide.get("images", [])
+    if not lines:
+        return None
+    title = ""
+    body = lines
+    if len(lines) >= 2 and len(lines[0]) <= 100:
+        title, body = lines[0], lines[1:]
+    body_txt = "\n".join(body)
+    if images and len(body_txt) <= MAX_BODY_WITH_IMAGE:
+        return {"skip": False, "template_id": "texto_imagen", "image_index": 0,
+                "fields": [{"pos": "1", "text": title}, {"pos": "3", "text": body_txt}]}
+    tid = "contenido_bullets" if len(body) > 1 else "contenido_simple"
+    return {"skip": False, "template_id": tid, "image_index": -1,
+            "fields": [{"pos": "1", "text": title}, {"pos": "3", "text": body_txt}]}
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    """Parte un texto en trozos <= limit sin cortar líneas (y, si una línea es
+    más larga que el límite, sin cortar frases ni palabras)."""
+    pieces = []
+    for line in text.split("\n"):
+        if len(line) <= limit:
+            pieces.append(line)
+            continue
+        cur = ""
+        for sent in re.split(r"(?<=[.!?;:])\s+", line):
+            while len(sent) > limit:
+                cut = sent.rfind(" ", 0, limit)
+                cut = cut if cut > 0 else limit
+                if cur:
+                    pieces.append(cur); cur = ""
+                pieces.append(sent[:cut].strip())
+                sent = sent[cut:].strip()
+            if cur and len(cur) + 1 + len(sent) > limit:
+                pieces.append(cur); cur = sent
+            else:
+                cur = (cur + " " + sent).strip()
+        if cur:
+            pieces.append(cur)
+    chunks, cur = [], ""
+    for p in pieces:
+        if cur and len(cur) + 1 + len(p) > limit:
+            chunks.append(cur); cur = p
+        else:
+            cur = (cur + "\n" + p) if cur else p
+    if cur:
+        chunks.append(cur)
+    return chunks or [text]
+
+
+def _split_overflow(raw: dict) -> list[dict]:
+    """Si el cuerpo es demasiado largo para su caja, lo reparte en diapositivas
+    de continuación (mismo título + '(cont.)') en vez de recortar o encoger."""
+    tid = raw.get("template_id")
+    pos = _BODY_POS.get(tid)
+    if pos is None:
+        return [raw]
+    fields = {str(f.get("pos")): (f.get("text") or "") for f in raw.get("fields", [])}
+    body = fields.get(pos, "")
+    limit = MAX_BODY_WITH_IMAGE if tid in _IMAGE_TEMPLATES else MAX_BODY_FULL
+    if len(body) <= limit:
+        return [raw]
+    chunks = _split_text(body, limit)
+    if len(chunks) == 1:
+        return [raw]
+    out = []
+    for k, chunk in enumerate(chunks):
+        if k == 0:
+            f = dict(fields); f[pos] = chunk
+            out.append({**raw, "fields": [{"pos": p, "text": t} for p, t in f.items()]})
+        else:
+            title = fields.get("1", "")
+            out.append({
+                "skip": False,
+                "template_id": "contenido_bullets" if "\n" in chunk else "contenido_simple",
+                "image_index": -1,
+                "fields": [
+                    {"pos": "0", "text": fields.get("0", "")},
+                    {"pos": "1", "text": (title + " (cont.)") if title else ""},
+                    {"pos": "2", "text": ""},
+                    {"pos": "3", "text": chunk},
+                ],
+            })
+    return out
+
+
+def _short_master_name(name: str) -> str:
+    name = (name or "").split(":")[0].strip()
+    return name[:40]
+
+
+def _build_fiel_prompt(slide: dict, deck_context: str) -> str:
+    n_images = len(slide.get("images", []))
+    img_line = (f"Imágenes reales disponibles de esta diapositiva: {n_images} (usa image_index 0 si procede)."
+                if n_images else "No hay imágenes reales extraídas de esta diapositiva.")
+    blocks = slide.get("text_blocks") or [slide.get("text", "")]
+    numbered = "\n".join(f"[{i + 1}] {b}" for i, b in enumerate(blocks)) or "(sin texto)"
+    return (
+        f"Documento: {deck_context}\n\n"
+        f"Bloques de texto de ESTA diapositiva de origen, en orden de lectura (cópialos literalmente):\n"
+        f"---\n{numbered}\n---\n\n{img_line}\n\nDevuelve el JSON de mapeo para esta diapositiva."
+    )
+
+
+async def map_deck_fiel(slides: list[dict], filename: str, api_key: str, master_name: str = "") -> tuple[list[dict], dict]:
+    """Modo fiel. Devuelve (specs de render en orden, informe). Una diapositiva
+    de origen produce 1 diapositiva (o más si el texto no cabe y se reparte
+    en continuaciones). Si el LLM altera el contenido o falla, esa diapositiva
+    se traspasa de forma literal sin LLM. Si TODAS las llamadas a Gemini
+    fallan, devuelve entradas '_error' (como el modo adaptado) para que la
+    app avise en vez de entregar un resultado sin pasar por el modelo."""
+    deck_context = _guess_deck_context(slides, filename)
+    kicker_default = _short_master_name(master_name)
+    system_prompt = FIEL_SYSTEM_PROMPT.replace("{catalog}", catalog_prompt_text(FIEL_TEMPLATES))
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    per_slide: list[list[dict]] = [[] for _ in slides]
+    stats = {"gemini_ok": 0, "gemini_error": 0, "literal": 0, "divididas": 0, "omitidas": 0}
+    first_error = {"msg": ""}
+
+    async with httpx.AsyncClient() as client:
+        async def worker(i: int, slide: dict):
+            async with sem:
+                raw = None
+                try:
+                    raw = await _call_gemini(client, api_key, system_prompt, _build_fiel_prompt(slide, deck_context), temperature=0.1)
+                    stats["gemini_ok"] += 1
+                except Exception as e:
+                    stats["gemini_error"] += 1
+                    first_error["msg"] = first_error["msg"] or _clean_err(e)
+                if raw is not None and raw.get("template_id") not in FIEL_TEMPLATES and not raw.get("skip"):
+                    raw = None  # plantilla no permitida en modo fiel
+                ok = False
+                if raw is not None:
+                    ok, _cov = _fiel_check(raw, slide)
+                if raw is not None and ok:
+                    if raw.get("skip"):
+                        stats["omitidas"] += 1
+                        return
+                    raw = _enforce_image_reuse(raw, slide, use_left_side=(i % 2 == 1))
+                else:
+                    raw = _literal_raw(slide)
+                    if raw is None:
+                        stats["omitidas"] += 1
+                        return
+                    stats["literal"] += 1
+                parts = _split_overflow(raw)
+                if len(parts) > 1:
+                    stats["divididas"] += 1
+                for part in parts:
+                    spec = _resolve_spec(part, keep_empty=True, kicker_default=kicker_default)
+                    if spec is not None:
+                        _attach_image(spec, slide)
+                        per_slide[i].append(spec)
+
+        await asyncio.gather(*(worker(i, s) for i, s in enumerate(slides)))
+
+    if slides and stats["gemini_error"] == len(slides):
+        return [{"_error": first_error["msg"] or "Gemini no respondió", "_slide_index": s["index"]} for s in slides], stats
+    specs = [sp for group in per_slide for sp in group]
+    stats["diapositivas_origen"] = len(slides)
+    stats["diapositivas_resultado"] = len(specs)
+    if first_error["msg"]:
+        stats["aviso"] = first_error["msg"]
+    return specs, stats
