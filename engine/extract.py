@@ -23,15 +23,23 @@ from pptx import Presentation
 MIN_IMAGE_PIXELS = 120 * 120  # descarta iconos/logos minúsculos como "imagen de contenido"
 
 
-def extract_pptx(file_obj: BinaryIO) -> list[dict]:
-    prs = Presentation(file_obj)
-    slides = []
-    for i, slide in enumerate(prs.slides):
-        blocks = []
-        images = []
-        for shp in slide.shapes:
-            if shp.has_text_frame and shp.text_frame.text.strip():
+def _walk_shapes(shapes, blocks: list, images: list, tables: list, depth: int = 0) -> None:
+    """Recorre las formas de una diapositiva (incluidos grupos anidados) y
+    recoge texto, imágenes y tablas reales."""
+    for shp in shapes:
+        try:
+            if getattr(shp, "has_text_frame", False) and shp.text_frame.text.strip():
                 blocks.append(shp.text_frame.text.strip())
+            if getattr(shp, "has_table", False) and shp.has_table:
+                rows = []
+                for row in shp.table.rows:
+                    cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                    if any(cells):
+                        rows.append(cells)
+                if rows:
+                    tables.append(rows)
+                    for cells in rows:
+                        blocks.append(" | ".join(c for c in cells if c))
             if shp.shape_type == 13:  # PICTURE
                 try:
                     blob = shp.image.blob
@@ -39,16 +47,27 @@ def extract_pptx(file_obj: BinaryIO) -> list[dict]:
                         images.append(blob)
                 except Exception:
                     pass
-            if getattr(shp, "shape_type", None) == 6:  # GROUP -- baja un nivel
-                for sub in shp.shapes:
-                    if sub.has_text_frame and sub.text_frame.text.strip():
-                        blocks.append(sub.text_frame.text.strip())
+            if getattr(shp, "shape_type", None) == 6 and depth < 5:  # GROUP -- baja niveles
+                _walk_shapes(shp.shapes, blocks, images, tables, depth + 1)
+        except Exception:
+            continue
+
+
+def extract_pptx(file_obj: BinaryIO) -> list[dict]:
+    prs = Presentation(file_obj)
+    slides = []
+    for i, slide in enumerate(prs.slides):
+        blocks: list = []
+        images: list = []
+        tables: list = []
+        _walk_shapes(slide.shapes, blocks, images, tables)
         images.sort(key=len, reverse=True)
         slides.append({
             "index": i,
             "text": "\n".join(blocks),
             "text_blocks": blocks,
             "images": images[:4],
+            "tables": tables,
         })
     return slides
 
