@@ -565,7 +565,11 @@ def _split_overflow(raw: dict) -> list[dict]:
 
 def _short_master_name(name: str) -> str:
     name = (name or "").split(":")[0].strip()
-    return name[:40]
+    if name.lower().startswith("general"):
+        return ""  # sin máster concreto: el kicker se deja en blanco
+    if len(name) > 70:  # recorta en límite de palabra, nunca a mitad de una
+        name = name[:70].rsplit(" ", 1)[0]
+    return name
 
 
 def _build_fiel_prompt(slide: dict, deck_context: str) -> str:
