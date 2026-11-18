@@ -20,8 +20,15 @@ Dos modos de construcción de diapositiva, según el layout de destino:
 
 Para las diapositivas con imagen (TEXTO + IMAGEN, IMAGEN + TEXTO,
 IMAGEN COMPLETA) se borra el placeholder de imagen y se inserta la imagen
-real en su mismo bounding box (ajustada por 'cover': se recorta para llenar
-el hueco sin deformar).
+real en su mismo bounding box. Por defecto se ajusta por 'cover' (se
+recorta para llenar el hueco sin deformar), pero si la imagen de origen y
+el hueco tienen proporciones muy distintas y ese recorte perdería más de un
+30% de la imagen (p.ej. una captura de móvil muy vertical insertada en un
+hueco apaisado), se usa 'contain' en su lugar: la imagen COMPLETA, sin
+recortar, centrada sobre un fondo del color medio de su propio borde -- así
+no se pierde texto, caras ni contenido importante cerca de los bordes de la
+imagen original (bug detectado el 2026-11-18: capturas verticales
+recortaban por arriba y por abajo, perdiendo cabeceras y caras).
 """
 from __future__ import annotations
 
@@ -172,16 +179,47 @@ def remove_shape_at(slide, pos: int) -> None:
         shp._element.getparent().remove(shp._element)
 
 
+# Si el recorte 'cover' necesitaría descartar más de esta fracción de la
+# imagen en el eje recortado, se usa 'contain' en su lugar (ver más abajo).
+# Bug real detectado el 2026-11-18: con proporciones muy distintas (p.ej.
+# una captura de móvil 9:16 en un hueco 4:3), el cover-fit anterior recortaba
+# más de la mitad de la imagen, cortando cabeceras y caras.
+_MAX_COVER_CROP_FRACTION = 0.30
+
+
+def _edge_pad_color(im: "Image.Image", axis: str):
+    """Color medio de una franja del borde de la imagen (superior/inferior si
+    axis='h', izquierda/derecha si axis='v'), usado como fondo del margen al
+    componer en modo 'contain'. Así el margen añadido se mezcla con la propia
+    imagen en vez de dejar barras blancas que desentonen."""
+    w, h = im.size
+    try:
+        if axis == "h":
+            strip = im.crop((0, 0, w, max(1, h // 20)))
+        else:
+            strip = im.crop((0, 0, max(1, w // 20), h))
+        return strip.resize((1, 1)).getpixel((0, 0))
+    except Exception:
+        return (255, 255, 255)
+
+
 def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
-    """Prepara (recorta cover-fit) una imagen para llenar `box` (left, top,
-    width, height en EMU) sin deformarla, SIN tocar la diapositiva. Devuelve
-    None si la imagen no se puede decodificar (formato no soportado -- p.ej.
-    WMF/EMF heredado de un .pptx antiguo -- bytes corruptos, dimensiones
-    inválidas, etc.) en vez de propagar la excepción: así una única imagen
-    problemática del documento de origen no puede tirar abajo la adaptación
-    completa del archivo. El llamador debe comprobar el resultado antes de
-    borrar la forma/placeholder original, para poder dejarlo intacto si la
-    imagen no es utilizable (degradación grácil)."""
+    """Prepara una imagen para llenar `box` (left, top, width, height en EMU)
+    sin deformarla, SIN tocar la diapositiva. Devuelve None si la imagen no
+    se puede decodificar (formato no soportado -- p.ej. WMF/EMF heredado de
+    un .pptx antiguo -- bytes corruptos, dimensiones inválidas, etc.) en vez
+    de propagar la excepción: así una única imagen problemática del
+    documento de origen no puede tirar abajo la adaptación completa del
+    archivo. El llamador debe comprobar el resultado antes de borrar la
+    forma/placeholder original, para poder dejarlo intacto si la imagen no
+    es utilizable (degradación grácil).
+
+    Por defecto usa 'cover' (recorta centrado para llenar el hueco). Si eso
+    exigiría descartar más de `_MAX_COVER_CROP_FRACTION` de la imagen porque
+    su proporción es muy distinta a la del hueco, usa 'contain' en su lugar:
+    la imagen COMPLETA, sin recortar, centrada sobre un fondo del color medio
+    de su propio borde -- para no perder contenido importante cerca de los
+    bordes (texto, caras, UI...)."""
     left, top, width, height = box
     if not width or not height:
         return None
@@ -193,15 +231,38 @@ def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
             return None
         target_ratio = width / height
         src_ratio = src_w / src_h
+
         if src_ratio > target_ratio:
-            # imagen más ancha de lo necesario -> recorta lados
-            new_w = max(1, int(src_h * target_ratio))
-            x0 = (src_w - new_w) // 2
-            im = im.crop((x0, 0, x0 + new_w, src_h))
+            # imagen más ancha de lo necesario -> recortaría los lados
+            discarded = 1 - (max(1, int(src_h * target_ratio)) / src_w)
         else:
-            new_h = max(1, int(src_w / target_ratio))
-            y0 = (src_h - new_h) // 2
-            im = im.crop((0, y0, src_w, y0 + new_h))
+            # imagen más alta de lo necesario -> recortaría arriba/abajo
+            discarded = 1 - (max(1, int(src_w / target_ratio)) / src_h)
+
+        if discarded > _MAX_COVER_CROP_FRACTION:
+            # 'contain': reescala la imagen completa para que quepa entera
+            # dentro de la proporción del hueco, centrada sobre un fondo que
+            # toma el color medio del borde de la propia imagen.
+            work_w = 1600
+            work_h = max(1, round(work_w * height / width))
+            scale = min(work_w / src_w, work_h / src_h)
+            new_w = max(1, round(src_w * scale))
+            new_h = max(1, round(src_h * scale))
+            resized = im.resize((new_w, new_h))
+            pad_color = _edge_pad_color(im, "h" if src_ratio > target_ratio else "v")
+            canvas = Image.new("RGB", (work_w, work_h), pad_color)
+            canvas.paste(resized, ((work_w - new_w) // 2, (work_h - new_h) // 2))
+            im = canvas
+        else:
+            if src_ratio > target_ratio:
+                new_w = max(1, int(src_h * target_ratio))
+                x0 = (src_w - new_w) // 2
+                im = im.crop((x0, 0, x0 + new_w, src_h))
+            else:
+                new_h = max(1, int(src_w / target_ratio))
+                y0 = (src_h - new_h) // 2
+                im = im.crop((0, y0, src_w, y0 + new_h))
+
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=88)
     except Exception:
