@@ -182,15 +182,19 @@ def _scrub(e) -> str:
 
 
 def _suffix_for(mode_run: str, mode_req: str) -> str:
-    """Sufijo del nombre de salida. Con el modo 'adaptado' solo (el de siempre)
-    se mantiene '_IMSED' para no romper la automatización de Drive."""
-    if mode_run == "fiel":
-        return "_IMSED_fiel"
-    return "_IMSED" if mode_req == "adaptado" else "_IMSED_adaptada"
+    """Sufijo del nombre de salida. Con un solo modo (sea 'fiel' -- el
+    estándar desde 2026-11-20, para no reescribir el contenido del profesor,
+    solo aplicarle el diseño -- o 'adaptado') se mantiene '_IMSED' de
+    siempre, porque la automatización de Drive identifica el resultado por
+    ese sufijo exacto. Con 'ambos' (las dos versiones a la vez) sí hace
+    falta distinguirlas."""
+    if mode_req != "ambos":
+        return "_IMSED"
+    return "_IMSED_fiel" if mode_run == "fiel" else "_IMSED_adaptada"
 
 
 async def _process_one(filename: str, src_path: str, api_key: str, master_path: Path, qr_url: str,
-                       mode: str = "adaptado", master_name: str = "") -> tuple[list[tuple[str, bytes]], list[str], dict]:
+                       mode: str = "fiel", master_name: str = "") -> tuple[list[tuple[str, bytes]], list[str], dict]:
     """Adapta un archivo que ya está en disco (src_path). Borra el original y los
     intermedios en cuanto dejan de hacer falta y libera memoria al terminar.
     Devuelve ([(sufijo, bytes)], avisos, informe). mode: adaptado | fiel | ambos."""
@@ -259,7 +263,7 @@ async def _process_one(filename: str, src_path: str, api_key: str, master_path: 
 
 
 async def _process_batch(files_data: list[tuple[str, str]], api_key: str, master_path: Path, qr_url: str,
-                         mode: str = "adaptado", master_name: str = ""):
+                         mode: str = "fiel", master_name: str = ""):
     results: list[tuple[str, bytes]] = []
     errors: list[str] = []
     reports: dict = {}
@@ -297,7 +301,6 @@ def _report_header(reports: dict) -> str:
     except Exception:
         return "{}"
 
-
 @app.post("/transform")
 def transform():
     api_key = request.form.get("gemini_api_key", "").strip() or GEMINI_API_KEY_ENV
@@ -324,9 +327,11 @@ def transform():
         raise AppError(400, f"Máster no reconocido: {master_value!r}. Opciones: {valid}")
     qr_url = forms_url_for(master)
 
-    # Modo: 'adaptado' (el de siempre: condensa y recoloca), 'fiel' (traspaso
-    # literal del contenido a la plantilla) o 'ambos' (genera las dos versiones).
-    mode = request.form.get("mode", "adaptado").strip().lower() or "adaptado"
+    # Modo: 'fiel' (estándar desde 2026-11-20: traspasa el contenido LITERAL
+    # del profesor a la plantilla, sin resumir ni reescribir -- solo cambia
+    # el diseño), 'adaptado' (condensa y recoloca con más libertad; se puede
+    # seguir pidiendo explícitamente) o 'ambos' (genera las dos versiones).
+    mode = request.form.get("mode", "fiel").strip().lower() or "fiel"
     if mode not in MODES:
         raise AppError(400, f"Modo no reconocido: {mode!r}. Opciones: {', '.join(MODES)}")
 
