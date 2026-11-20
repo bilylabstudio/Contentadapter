@@ -200,7 +200,6 @@ def _enforce_image_reuse(raw: dict, slide: dict, use_left_side: bool) -> dict:
         "image_index": 0,
     }
 
-
 def _resolve_spec(raw: dict, keep_empty: bool = False, kicker_default: str = "") -> Optional[dict]:
     """Convierte la respuesta del LLM (con template_id del catálogo) en un
     'render spec' que engine.build.build_deck entiende (con example_index,
@@ -246,6 +245,7 @@ def _resolve_spec(raw: dict, keep_empty: bool = False, kicker_default: str = "")
             "layout": tpl["layout"],
             "fields": fields,
             "images": {},
+            "image_links": {},
         }
         image_field = tpl.get("image_field")
         image_index = raw.get("image_index", -1)
@@ -259,6 +259,7 @@ def _resolve_spec(raw: dict, keep_empty: bool = False, kicker_default: str = "")
         "example_index": tpl["example_index"],
         "shape_text": fields,
         "images": {},
+        "image_links": {},
         "delete_positions": delete_positions,
     }
 
@@ -351,14 +352,27 @@ def _clean_err(e) -> str:
 
 
 def _attach_image(spec: dict, slide: dict) -> None:
-    """Resuelve la imagen elegida (índice) a bytes reales de la diapositiva de origen."""
+    """Resuelve la imagen elegida (índice) a bytes reales de la diapositiva de
+    origen, y si esa imagen tenía un hipervínculo en el original (p.ej. la
+    miniatura de un vídeo de TikTok/YouTube enlazada al vídeo real), lo
+    propaga también para que build.py lo conserve en la diapositiva nueva."""
     img_idx = spec.pop("_image_index", None)
     if img_idx is not None:
         images = slide.get("images", [])
         if 0 <= img_idx < len(images):
             field = spec.pop("_image_field", None) or spec.pop("_image_slot", None)
             if field is not None:
-                spec["images"][str(field)] = images[img_idx]
+                item = images[img_idx]
+                # Compatibilidad: items antiguos como bytes planos (no debería
+                # darse ya que extract.py siempre produce dicts, pero por si
+                # algún llamador externo pasa datos en el formato anterior).
+                if isinstance(item, dict):
+                    spec["images"][str(field)] = item.get("bytes")
+                    url = item.get("url")
+                    if url:
+                        spec.setdefault("image_links", {})[str(field)] = url
+                else:
+                    spec["images"][str(field)] = item
     spec.pop("_image_field", None)
     spec.pop("_image_slot", None)
 
@@ -491,7 +505,6 @@ def _literal_raw(slide: dict) -> Optional[dict]:
     tid = "contenido_bullets" if len(body) > 1 else "contenido_simple"
     return {"skip": False, "template_id": tid, "image_index": -1,
             "fields": [{"pos": "1", "text": title}, {"pos": "3", "text": body_txt}]}
-
 
 def _split_text(text: str, limit: int) -> list[str]:
     """Parte un texto en trozos <= limit sin cortar líneas (y, si una línea es
