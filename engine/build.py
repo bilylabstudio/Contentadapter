@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import copy
 import io
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -110,6 +111,125 @@ def list_editable_shapes(slide) -> list[dict]:
     return out
 
 
+_EMU_PER_PT = 12700
+_DEFAULT_FONT_PT = 18.0
+_AVG_CHAR_WIDTH_FACTOR = 0.52  # ancho medio de carácter ~ 0.52 * tamaño de fuente (texto latino mixto)
+_LINE_HEIGHT_FACTOR = 1.2      # alto de línea ~ 1.2 * tamaño de fuente (interlineado sencillo)
+_MIN_FONT_SCALE = 0.5          # no reducir la fuente por debajo del 50% (deja de ser legible)
+_MAX_LN_SPC_REDUCTION = 0.20   # tope habitual de PowerPoint para la reducción de interlineado
+
+
+def _shape_text_box_pt(shape) -> Optional[tuple[float, float]]:
+    """Ancho/alto en puntos del área de texto disponible dentro de la forma
+    (dimensiones de la forma menos los márgenes internos del cuadro de
+    texto, bIns/tIns/lIns/rIns -- usa los valores del XML si están
+    explícitos, o los márgenes por defecto de PowerPoint en caso contrario)."""
+    try:
+        width_emu, height_emu = shape.width, shape.height
+    except Exception:
+        return None
+    if not width_emu or not height_emu:
+        return None
+    bodyPr = shape.text_frame._txBody.find(qn("a:bodyPr"))
+
+    def _inset(attr, default):
+        if bodyPr is not None and bodyPr.get(attr) is not None:
+            try:
+                return int(bodyPr.get(attr))
+            except ValueError:
+                return default
+        return default
+
+    l_ins = _inset("lIns", 91440)
+    r_ins = _inset("rIns", 91440)
+    t_ins = _inset("tIns", 45720)
+    b_ins = _inset("bIns", 45720)
+    avail_w = (width_emu - l_ins - r_ins) / _EMU_PER_PT
+    avail_h = (height_emu - t_ins - b_ins) / _EMU_PER_PT
+    return max(avail_w, 1.0), max(avail_h, 1.0)
+
+def _is_wide_char(ch: str) -> bool:
+    """True para caracteres "anchos" (CJK, Hangul, kana, puntuación de ancho
+    completo...) que ocupan aproximadamente un em completo en vez del ~0.5em
+    tÍpico de una fuente latina. El contenido de IMSED es hoy en español,
+    pero esto evita que el autoajuste calculado SUBESTIME el espacio
+    necesario (y por tanto deje texto desbordado) si algún día se adapta
+    contenido con texto en chino/japonés/coreano."""
+    cp = ord(ch)
+    return (
+        0x1100 <= cp <= 0x11FF or  # Hangul Jamo
+        0x3040 <= cp <= 0x30FF or  # Hiragana/Katakana
+        0x3400 <= cp <= 0x4DBF or  # CJK Ext A
+        0x4E00 <= cp <= 0x9FFF or  # CJK Unified
+        0xAC00 <= cp <= 0xD7A3 or  # Hangul Syllables
+        0xF900 <= cp <= 0xFAFF or  # CJK Compat
+        0xFF00 <= cp <= 0xFFEF     # Full-width forms
+    )
+
+
+def _effective_char_width_factor(line: str) -> float:
+    """Factor de ancho medio de carácter (como fracción del tamaño de
+    fuente) para una línea concreta, ajustado al alza si una fracción
+    relevante de sus caracteres son "anchos" (ver _is_wide_char)."""
+    if not line:
+        return _AVG_CHAR_WIDTH_FACTOR
+    wide = sum(1 for ch in line if _is_wide_char(ch))
+    frac_wide = wide / len(line)
+    if frac_wide <= 0:
+        return _AVG_CHAR_WIDTH_FACTOR
+    # Un carácter ancho ocupa ~1.0em frente a ~0.52em de uno latino medio;
+    # se interpola según la fracción de caracteres anchos de la línea.
+    return _AVG_CHAR_WIDTH_FACTOR + frac_wide * (1.0 - _AVG_CHAR_WIDTH_FACTOR)
+
+
+def _compute_autofit(shape, new_lines: list[str], rpr_templates: list) -> Optional[tuple[int, int]]:
+    """Estima -- sin un motor de layout de texto real, que no está disponible
+    aquí -- cuánto haría falta reducir la fuente (fontScale) y el
+    interlineado (lnSpcReduction) para que el texto quepa en la caja, y
+    devuelve ya los valores codificados como los espera <a:normAutofit>
+    (milésimas de punto porcentual). Devuelve None si no hace falta reducir
+    nada (el texto ya cabe a tamaño completo) o si no se puede estimar.
+
+    Esto sustituye a dejar <a:normAutofit/> vacío confiando en que el propio
+    visor (PowerPoint, Google Slides, LibreOffice...) recalcule el
+    porcentaje de reducción en el momento de abrir el archivo -- ese cálculo
+    "en vivo" no es fiable de forma consistente entre visores y es la causa
+    más probable de las cajas de texto descuadradas reportadas por el
+    cliente: con un valor explícito ya horneado en el archivo, todos los
+    visores muestran lo mismo."""
+    box = _shape_text_box_pt(shape)
+    if box is None:
+        return None
+    avail_w, avail_h = box
+
+    required_h = 0.0
+    for i, line in enumerate(new_lines):
+        t_idx = min(i, len(rpr_templates) - 1) if rpr_templates else -1
+        rPr = rpr_templates[t_idx] if 0 <= t_idx < len(rpr_templates) else None
+        font_pt = _DEFAULT_FONT_PT
+        if rPr is not None and rPr.get("sz") is not None:
+            try:
+                font_pt = int(rPr.get("sz")) / 100.0
+            except ValueError:
+                pass
+        char_w_pt = max(font_pt * _effective_char_width_factor(line), 1.0)
+        line_h_pt = font_pt * _LINE_HEIGHT_FACTOR
+        n_chars = max(len(line), 1)
+        wrapped_lines = max(1, math.ceil((n_chars * char_w_pt) / avail_w))
+        required_h += wrapped_lines * line_h_pt
+
+    if required_h <= 0 or required_h <= avail_h:
+        return None  # cabe a tamaño completo, no se toca nada
+
+    scale = max(avail_h / required_h, _MIN_FONT_SCALE)
+    if scale >= 0.999:
+        return None
+
+    font_scale_val = max(25000, min(100000, int(round(scale * 100)) * 1000))
+    ln_spc_val = max(0, min(20000, int(round(min(_MAX_LN_SPC_REDUCTION, (1 - scale) * 0.6) * 100)) * 1000))
+    return font_scale_val, ln_spc_val
+
+
 def set_shape_text(shape, text: str) -> None:
     """Sustituye el texto de una forma preservando el formato COMPLETO de
     cada párrafo original: no solo fuente/tamaño/color, sino también su
@@ -163,11 +283,24 @@ def set_shape_text(shape, text: str) -> None:
         txBody.append(new_p)
 
     # evita que texto más largo que el original desborde la forma y pise a
-    # las formas vecinas (título largo tapando el subtítulo, etc.): que
-    # PowerPoint/LibreOffice reduzca el tamaño de fuente automáticamente.
+    # las formas vecinas (título largo tapando el subtítulo, etc.).
     try:
         tf.word_wrap = True
         tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        # Lo anterior crea un <a:normAutofit/> vacío; python-pptx no calcula
+        # ni escribe el % de reducción real, así que cada visor lo recalcula
+        # "en vivo" a su manera (origen de cajas de texto descuadradas entre
+        # PowerPoint/Google Slides/LibreOffice). Calculamos aquí una
+        # estimación y la horneamos explícitamente en el XML para que el
+        # resultado sea el mismo en cualquier visor.
+        autofit_vals = _compute_autofit(shape, new_lines, rpr_templates)
+        if autofit_vals is not None:
+            bodyPr = txBody.find(qn("a:bodyPr"))
+            if bodyPr is not None:
+                normAutofit = bodyPr.find(qn("a:normAutofit"))
+                if normAutofit is not None:
+                    normAutofit.set("fontScale", str(autofit_vals[0]))
+                    normAutofit.set("lnSpcReduction", str(autofit_vals[1]))
     except Exception:
         pass
 
@@ -177,7 +310,6 @@ def remove_shape_at(slide, pos: int) -> None:
     if 0 <= pos < len(shapes):
         shp = shapes[pos]
         shp._element.getparent().remove(shp._element)
-
 
 # Si el recorte 'cover' necesitaría descartar más de esta fracción de la
 # imagen en el eje recortado, se usa 'contain' en su lugar (ver más abajo).
@@ -284,6 +416,20 @@ def insert_image_cover(slide, box, image_bytes: bytes) -> bool:
     return True
 
 
+def _attach_hyperlink(pic, url: Optional[str]) -> None:
+    """Si la imagen de origen (p.ej. la miniatura de un vídeo de
+    TikTok/YouTube) tenía un hipervínculo asociado, lo añade también a la
+    imagen insertada para que siga siendo "clicable" en la diapositiva
+    adaptada. Antes de este fix la miniatura se copiaba como imagen plana y
+    el enlace al vídeo se perdía por completo."""
+    if not url:
+        return
+    try:
+        pic.click_action.hyperlink.address = url
+    except Exception:
+        pass
+
+
 def get_placeholder(slide, idx: int):
     for ph in slide.placeholders:
         if ph.placeholder_format.idx == idx:
@@ -317,6 +463,7 @@ def render_placeholder_slide(prs: Presentation, spec: dict):
         ph = get_placeholder(slide, idx)
         if ph is not None and text:
             set_shape_text(ph, text)
+    image_links = spec.get("image_links", {})
     for idx_str, image_bytes in spec.get("images", {}).items():
         idx = int(idx_str)
         box = get_placeholder_box(layout, idx)
@@ -325,11 +472,11 @@ def render_placeholder_slide(prs: Presentation, spec: dict):
             buf = _prepare_cover_image(box, image_bytes)
             if buf is not None:
                 remove_shape_at(slide, list(slide.shapes).index(ph))
-                slide.shapes.add_picture(buf, *box)
+                pic = slide.shapes.add_picture(buf, *box)
+                _attach_hyperlink(pic, image_links.get(idx_str))
             # si la imagen no se pudo decodificar, se deja el placeholder de
             # texto/vacío original tal cual en vez de perder toda la diapositiva
     return slide
-
 
 def _clear_cell_text(tc_el) -> None:
     """Vacía el texto de una celda de tabla clonada (de una fila/columna
@@ -486,6 +633,7 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
         pos = int(pos_str)
         if 0 <= pos < len(shapes):
             set_shape_text(shapes[pos], text)
+    image_links = spec.get("image_links", {})
     for pos_str, image_bytes in spec.get("images", {}).items():
         pos = int(pos_str)
         if 0 <= pos < len(shapes):
@@ -494,7 +642,8 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
             buf = _prepare_cover_image(box, image_bytes)
             if buf is not None:
                 remove_shape_at(slide, pos)
-                slide.shapes.add_picture(buf, *box)
+                pic = slide.shapes.add_picture(buf, *box)
+                _attach_hyperlink(pic, image_links.get(pos_str))
             # si la imagen no se pudo decodificar, se deja la forma original
             # (p.ej. el placeholder de imagen de ejemplo) tal cual, en vez de
             # perder toda la diapositiva
@@ -505,7 +654,6 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
         if 0 <= pos < len(shapes) and shapes[pos].has_table:
             _fill_table(shapes[pos], table_spec["rows"], sibling_shapes=shapes)
     return slide
-
 
 # ---------------------------------------------------------------------------
 # Diapositiva de cierre con QR de valoración por máster
@@ -650,7 +798,6 @@ def normalize_closing_spec(slide_specs: list[dict]) -> list[dict]:
     }
     kept.append(closing)
     return kept
-
 
 def build_deck(master_path: str, output_path: str, slide_specs: list[dict], example_master_path: Optional[str] = None,
                qr_url: Optional[str] = None):
