@@ -371,6 +371,8 @@ def _attach_image(spec: dict, slide: dict) -> None:
                     url = item.get("url")
                     if url:
                         spec.setdefault("image_links", {})[str(field)] = url
+                    if item.get("no_crop"):
+                        spec.setdefault("image_no_crop", {})[str(field)] = True
                 else:
                     spec["images"][str(field)] = item
     spec.pop("_image_field", None)
