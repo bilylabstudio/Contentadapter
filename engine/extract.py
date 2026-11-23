@@ -22,6 +22,7 @@ from collections import defaultdict
 from typing import BinaryIO
 
 import pypdf
+from PIL import Image
 from pptx import Presentation
 
 
@@ -42,6 +43,18 @@ MIN_IMAGE_PIXELS = 120 * 120  # descarta iconos/logos minúsculos como "imagen d
 # logo repetido como si fuera la foto de esa diapositiva.
 _DECORATIVE_MIN_SLIDES = 4
 
+# Tolerancia (como fracción del ancho de diapositiva) para considerar que dos
+# imágenes comparten la misma posición/anchura horizontal -- es decir, que
+# son "columnas" verticales del mismo elemento, no fotos distintas colocadas
+# una al lado de la otra.
+_STACK_X_TOL_FRAC = 0.03
+
+# Tolerancia (como fracción de la altura del fragmento) para considerar que
+# dos fragmentos están "pegados" verticalmente (sin hueco real entre ellos),
+# permitiendo un pequeño solape o hueco como el que deja un recorte manual de
+# una captura de pantalla larga.
+_STACK_GAP_TOL_FRAC = 0.15
+
 
 def _img_hash(blob: bytes) -> str:
     return hashlib.md5(blob).hexdigest()
@@ -57,6 +70,22 @@ def _shape_hyperlink(shp) -> str | None:
     try:
         url = shp.click_action.hyperlink.address
         return url or None
+    except Exception:
+        return None
+
+
+def _shape_position(shp) -> tuple[int, int, int, int] | None:
+    """Posición/tamaño (left, top, width, height) de una forma en EMU, si se
+    puede leer. Se usa solo para detectar capturas de pantalla largas
+    partidas en varios trozos apilados (ver `_merge_stacked_fragments`); si
+    no está disponible (p.ej. forma dentro de un grupo con transform raro),
+    esa imagen simplemente no participa en la fusión y sigue su camino
+    normal -- no es un dato imprescindible para el resto del pipeline."""
+    try:
+        left, top, width, height = shp.left, shp.top, shp.width, shp.height
+        if None in (left, top, width, height):
+            return None
+        return (int(left), int(top), int(width), int(height))
     except Exception:
         return None
 
@@ -105,7 +134,8 @@ def _chart_text(shp) -> str:
 
 def _walk_shapes(shapes, blocks: list, images: list, tables: list, depth: int = 0) -> None:
     """Recorre las formas de una diapositiva (incluidos grupos anidados) y
-    recoge texto, imágenes (con su hipervínculo si lo tienen) y tablas reales."""
+    recoge texto, imágenes (con su hipervínculo y posición si las tienen) y
+    tablas reales."""
     for shp in shapes:
         try:
             if getattr(shp, "has_text_frame", False) and shp.text_frame.text.strip():
@@ -124,7 +154,11 @@ def _walk_shapes(shapes, blocks: list, images: list, tables: list, depth: int = 
                 try:
                     blob = shp.image.blob
                     if len(blob) > 8000:  # descarta imágenes triviales/decorativas muy pequeñas
-                        images.append({"bytes": blob, "url": _shape_hyperlink(shp)})
+                        images.append({
+                            "bytes": blob,
+                            "url": _shape_hyperlink(shp),
+                            "pos": _shape_position(shp),
+                        })
                 except Exception:
                     pass
             if getattr(shp, "has_chart", False) and shp.has_chart:
@@ -135,6 +169,110 @@ def _walk_shapes(shapes, blocks: list, images: list, tables: list, depth: int = 
                 _walk_shapes(shp.shapes, blocks, images, tables, depth + 1)
         except Exception:
             continue
+
+
+def _merge_stacked_fragments(images: list[dict], ref_width: int) -> list[dict]:
+    """Une en una sola imagen los grupos de imágenes que son, en realidad,
+    trozos verticales de una misma captura de pantalla larga: misma posición
+    horizontal (mismo `left` y `width`, dentro de tolerancia) y apiladas sin
+    hueco real entre un trozo y el siguiente (`top` del trozo N+1 ≈ `top` +
+    `height` del trozo N). Es un patrón muy habitual cuando alguien pega en
+    la diapositiva una captura de pantalla de scroll largo (p.ej. resultados
+    de Google) partida en 2-4 trozos porque no cabía entera en una sola
+    captura.
+
+    Sin esto, el resto del pipeline (que se queda solo con las 4 imágenes
+    más grandes en bytes de la diapositiva, pensando que son fotos
+    independientes) elegía arbitrariamente uno solo de los trozos como "la"
+    imagen de la diapositiva, perdiendo el resto del contenido de la
+    captura sin ningún aviso (ejemplo real: una captura de resultados de
+    Google cortada por el lateral, con palabras partidas a mitad).
+
+    Las imágenes SIN posición conocida (`pos` es None) nunca se agrupan --
+    se dejan tal cual, igual que antes de este fix. Si algún fragmento del
+    grupo no se puede decodificar con Pillow, ese grupo se deja intacto en
+    vez de arriesgarse a perder contenido o producir un archivo roto."""
+    positioned = [img for img in images if img.get("pos")]
+    unpositioned = [img for img in images if not img.get("pos")]
+    if len(positioned) < 2:
+        return images
+
+    x_tol = max(int(ref_width * _STACK_X_TOL_FRAC), 1) if ref_width else 10 ** 9
+
+    n = len(positioned)
+    used = [False] * n
+    groups: list[list[int]] = []
+    for i in range(n):
+        if used[i]:
+            continue
+        group = [i]
+        used[i] = True
+        changed = True
+        while changed:
+            changed = False
+            for j in range(n):
+                if used[j]:
+                    continue
+                left_j, top_j, w_j, h_j = positioned[j]["pos"]
+                aligned = any(
+                    abs(positioned[k]["pos"][0] - left_j) <= x_tol
+                    and abs(positioned[k]["pos"][2] - w_j) <= x_tol
+                    for k in group
+                )
+                if not aligned:
+                    continue
+                tops = [positioned[k]["pos"][1] for k in group]
+                heights = [positioned[k]["pos"][3] for k in group]
+                bottoms = [t + h for t, h in zip(tops, heights)]
+                gap_tol = int(max([h_j] + heights) * _STACK_GAP_TOL_FRAC)
+                adjacent = (
+                    any(abs(top_j - b) <= gap_tol for b in bottoms)
+                    or any(abs((top_j + h_j) - t) <= gap_tol for t in tops)
+                )
+                if adjacent:
+                    group.append(j)
+                    used[j] = True
+                    changed = True
+        groups.append(group)
+
+    merged: list[dict] = []
+    for group in groups:
+        if len(group) == 1:
+            merged.append(positioned[group[0]])
+            continue
+        members = sorted((positioned[k] for k in group), key=lambda d: d["pos"][1])
+        try:
+            pil_imgs = [Image.open(io.BytesIO(m["bytes"])).convert("RGB") for m in members]
+        except Exception:
+            # No se pudo decodificar algún trozo: mejor dejarlos todos tal
+            # cual (igual que antes de este fix) que arriesgar un resultado
+            # corrupto o incompleto.
+            merged.extend(members)
+            continue
+        target_w = max(im.width for im in pil_imgs)
+        scaled = []
+        for im in pil_imgs:
+            if im.width != target_w:
+                new_h = max(1, round(im.height * (target_w / im.width)))
+                im = im.resize((target_w, new_h))
+            scaled.append(im)
+        total_h = sum(im.height for im in scaled)
+        canvas = Image.new("RGB", (target_w, total_h), "white")
+        y = 0
+        for im in scaled:
+            canvas.paste(im, (0, y))
+            y += im.height
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=92)
+        url = next((m.get("url") for m in members if m.get("url")), None)
+        left0, top0, w0, _ = members[0]["pos"]
+        total_h_emu = sum(m["pos"][3] for m in members)
+        merged.append({
+            "bytes": buf.getvalue(),
+            "url": url,
+            "pos": (left0, top0, w0, total_h_emu),
+        })
+    return merged + unpositioned
 
 
 def _filter_decorative(raw_slides: list[dict]) -> None:
@@ -158,12 +296,14 @@ def _filter_decorative(raw_slides: list[dict]) -> None:
 
 def extract_pptx(file_obj: BinaryIO) -> list[dict]:
     prs = Presentation(file_obj)
+    slide_width = prs.slide_width or 0
     slides = []
     for i, slide in enumerate(prs.slides):
         blocks: list = []
         images: list = []
         tables: list = []
         _walk_shapes(slide.shapes, blocks, images, tables)
+        images = _merge_stacked_fragments(images, slide_width)
         slides.append({
             "index": i,
             "text": "\n".join(blocks),
