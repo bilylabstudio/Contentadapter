@@ -335,7 +335,7 @@ def _edge_pad_color(im: "Image.Image", axis: str):
         return (255, 255, 255)
 
 
-def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
+def _prepare_cover_image(box, image_bytes: bytes, force_contain: bool = False) -> Optional[io.BytesIO]:
     """Prepara una imagen para llenar `box` (left, top, width, height en EMU)
     sin deformarla, SIN tocar la diapositiva. Devuelve None si la imagen no
     se puede decodificar (formato no soportado -- p.ej. WMF/EMF heredado de
@@ -351,7 +351,17 @@ def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
     su proporción es muy distinta a la del hueco, usa 'contain' en su lugar:
     la imagen COMPLETA, sin recortar, centrada sobre un fondo del color medio
     de su propio borde -- para no perder contenido importante cerca de los
-    bordes (texto, caras, UI...)."""
+    bordes (texto, caras, UI...).
+
+    `force_contain=True` (usado para las imágenes sintéticas que produce
+    `extract._merge_stacked_fragments`, marcadas con `no_crop` y propagadas
+    aquí vía `spec["image_no_crop"]`) salta directamente al modo 'contain'
+    sin mirar el porcentaje de recorte: en una captura de texto denso
+    (resultados de buscador, reseñas...) incluso el recorte pequeño que el
+    umbral normal permite corta palabras pegadas al borde (bug real:
+    títulos de resultado cortados a mitad como "tpilot" en vez de
+    "Trustpilot"). Para fotos normales el umbral de siempre sigue aplicando
+    sin cambios."""
     left, top, width, height = box
     if not width or not height:
         return None
@@ -364,14 +374,16 @@ def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
         target_ratio = width / height
         src_ratio = src_w / src_h
 
-        if src_ratio > target_ratio:
+        if force_contain:
+            discarded = 1.0
+        elif src_ratio > target_ratio:
             # imagen más ancha de lo necesario -> recortaría los lados
             discarded = 1 - (max(1, int(src_h * target_ratio)) / src_w)
         else:
             # imagen más alta de lo necesario -> recortaría arriba/abajo
             discarded = 1 - (max(1, int(src_w / target_ratio)) / src_h)
 
-        if discarded > _MAX_COVER_CROP_FRACTION:
+        if force_contain or discarded > _MAX_COVER_CROP_FRACTION:
             # 'contain': reescala la imagen completa para que quepa entera
             # dentro de la proporción del hueco, centrada sobre un fondo que
             # toma el color medio del borde de la propia imagen.
@@ -403,13 +415,13 @@ def _prepare_cover_image(box, image_bytes: bytes) -> Optional[io.BytesIO]:
     return buf
 
 
-def insert_image_cover(slide, box, image_bytes: bytes) -> bool:
+def insert_image_cover(slide, box, image_bytes: bytes, force_contain: bool = False) -> bool:
     """Inserta una imagen ocupando exactamente `box` (left, top, width, height
     en EMU), recortándola (cover-fit) para llenar el hueco sin deformarla.
     Devuelve True si se insertó, False si la imagen no se pudo decodificar
     (en cuyo caso no se ha añadido nada a la diapositiva)."""
     left, top, width, height = box
-    buf = _prepare_cover_image(box, image_bytes)
+    buf = _prepare_cover_image(box, image_bytes, force_contain=force_contain)
     if buf is None:
         return False
     slide.shapes.add_picture(buf, left, top, width, height)
@@ -464,12 +476,13 @@ def render_placeholder_slide(prs: Presentation, spec: dict):
         if ph is not None and text:
             set_shape_text(ph, text)
     image_links = spec.get("image_links", {})
+    image_no_crop = spec.get("image_no_crop", {})
     for idx_str, image_bytes in spec.get("images", {}).items():
         idx = int(idx_str)
         box = get_placeholder_box(layout, idx)
         ph = get_placeholder(slide, idx)
         if box and ph is not None:
-            buf = _prepare_cover_image(box, image_bytes)
+            buf = _prepare_cover_image(box, image_bytes, force_contain=bool(image_no_crop.get(idx_str)))
             if buf is not None:
                 remove_shape_at(slide, list(slide.shapes).index(ph))
                 pic = slide.shapes.add_picture(buf, *box)
@@ -634,12 +647,13 @@ def render_duplicate_slide(prs: Presentation, spec: dict):
         if 0 <= pos < len(shapes):
             set_shape_text(shapes[pos], text)
     image_links = spec.get("image_links", {})
+    image_no_crop = spec.get("image_no_crop", {})
     for pos_str, image_bytes in spec.get("images", {}).items():
         pos = int(pos_str)
         if 0 <= pos < len(shapes):
             shp = shapes[pos]
             box = (shp.left, shp.top, shp.width, shp.height)
-            buf = _prepare_cover_image(box, image_bytes)
+            buf = _prepare_cover_image(box, image_bytes, force_contain=bool(image_no_crop.get(pos_str)))
             if buf is not None:
                 remove_shape_at(slide, pos)
                 pic = slide.shapes.add_picture(buf, *box)
