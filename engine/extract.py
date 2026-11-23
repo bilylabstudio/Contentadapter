@@ -271,6 +271,15 @@ def _merge_stacked_fragments(images: list[dict], ref_width: int) -> list[dict]:
             "bytes": buf.getvalue(),
             "url": url,
             "pos": (left0, top0, w0, total_h_emu),
+            # Esta imagen es una composición sintética de varios trozos de
+            # una captura de pantalla (texto denso: resultados de buscador,
+            # reseñas...). El recorte "cover" de build.py (centrado, hasta un
+            # 30% de la imagen) es aceptable para fotos pero en una imagen
+            # así de texto-densa incluso un recorte pequeño corta palabras en
+            # los bordes (p.ej. títulos de resultado que empiezan pegados al
+            # borde izquierdo). Se marca para que build.py la trate siempre
+            # en modo "contain" (nunca recortada), sea cual sea su proporción.
+            "no_crop": True,
         })
     return merged + unpositioned
 
